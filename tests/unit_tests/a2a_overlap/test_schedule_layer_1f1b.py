@@ -330,7 +330,7 @@ class TestA2AOverlap:
                 capture_ref = run_transformer_layer_ref_with_capture(
                     gpt_model, input_tensors, microbatches
                 )
-            del gpt_model, model
+            del gpt_model
 
             gpt_model = GPTModel(
                 config=overlap_config,
@@ -340,7 +340,6 @@ class TestA2AOverlap:
                 post_process=True,
                 max_sequence_length=300,
             )
-            model = gpt_model.decoder.layers[0]
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 gpt_model, input_tensors, microbatches
