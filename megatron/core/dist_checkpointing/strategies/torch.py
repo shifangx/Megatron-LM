@@ -97,7 +97,7 @@ def register_default_torch_strategies():
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
     )
     register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
+        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=1)  # ARM64 fix: disable multiprocessing
     )
 
 
@@ -699,7 +699,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 2,
+        thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):

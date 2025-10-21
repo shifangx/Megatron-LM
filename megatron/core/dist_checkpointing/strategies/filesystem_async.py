@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import queue
+import traceback
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -35,6 +36,7 @@ from torch.futures import Future
 from .async_utils import _disable_gc
 
 logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)  # Set to DEBUG to see all messages
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
 
@@ -263,74 +265,123 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
-        ctx = mp.get_context("fork")
-        local_results_queue = ctx.Queue()
-        count_queue = ctx.JoinableQueue()
-        p_list = []
-        for i, write_bucket in enumerate(write_buckets):
+        
+        # For single bucket (thread_count=1), run synchronously for better error handling
+        if len(write_buckets) == 1:
+            logger.debug("FileSystemWriterAsync: running single-threaded (synchronous)")
             try:
-                count_queue.put(i)
-
-                kwargs = {
-                    "local_proc_idx": i,
-                    "write_bucket": write_bucket,
-                    "results_queue": local_results_queue,
-                    "count_queue": count_queue,
-                    "use_fsync": True,
-                }
-
+                write_bucket = write_buckets[0]
+                file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+                local_results = []
+                
+                extra_kwargs = {}
+                if "serialization_format" in inspect.signature(_write_item).parameters:
+                    from torch.distributed.checkpoint.filesystem import SerializationFormat
+                    extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+                    
                 if use_msc:
-                    import inspect
+                    import multistorageclient as msc
+                    open_file = msc.open
+                else:
+                    open_file = open
+                    
+                with open_file(file_name, "wb") as stream:
+                    for write_item, data in bytes_data:
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                            )
+                        )
 
-                    # Remove the inspect after the test_async_save.py is fixed.
-                    signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
-                    if len(signature.parameters) > 6:
-                        kwargs["use_msc"] = use_msc
+                    for write_item, tensor in tensor_data:
+                        assert tensor.is_cpu
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                            )
+                        )
 
-                p_list.append(
-                    ctx.Process(
-                        target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
-                        kwargs=kwargs,
-                    )
-                )
+                    if use_msc:
+                        stream.fsync()
+                    else:
+                        os.fsync(stream.fileno())
+                        
+                write_results_or_exc = {0: local_results}
+                logger.debug("FileSystemWriterAsync: single-threaded write completed successfully")
             except Exception as e:
-                err_msg = f"An error is caught while a proc {i} is created, error: {e}"
+                tb_str = traceback.format_exc()
+                err_msg = f"Single-threaded write failed at rank {rank}:\n{tb_str}"
                 logger.error(err_msg)
                 write_results_or_exc = RuntimeError(err_msg)
-
-        if not isinstance(write_results_or_exc, Exception):
-            for p in p_list:
-                p.start()
-
-            logger.debug("FileSystemWriterAsync: collecting worker results...")
-
-            # To make sure all nodes are completed
-            count_queue.join()
-            # At this point, all workers completed, so the queue should have exactly
-            # `len(write_buckets)` items
-            for proc_idx in range(len(write_buckets)):
+        else:
+            # Multi-process path
+            ctx = mp.get_context("fork")
+            local_results_queue = ctx.Queue()
+            count_queue = ctx.JoinableQueue()
+            p_list = []
+            for i, write_bucket in enumerate(write_buckets):
                 try:
-                    local_proc_idx, local_results_or_exc = local_results_queue.get()
-                except queue.Empty:
-                    write_results_or_exc = RuntimeError(
-                        "Unexpected empty `local_results_queue`"
-                        f" (got only {proc_idx}/{len(write_buckets)} items)"
-                    )
-                    break
-                else:
-                    if isinstance(local_results_or_exc, Exception):
-                        err_msg = (
-                            f"Local process {local_proc_idx} encountered"
-                            f" an error: {local_results_or_exc}"
-                        )
-                        logger.error(err_msg)
-                        write_results_or_exc = local_results_or_exc
-                        break
-                    assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
-                    write_results_or_exc[local_proc_idx] = local_results_or_exc
-                    p_list[local_proc_idx].join()
+                    count_queue.put(i)
 
-            logger.debug("FileSystemWriterAsync: collected worker results successfully")
+                    kwargs = {
+                        "local_proc_idx": i,
+                        "write_bucket": write_bucket,
+                        "results_queue": local_results_queue,
+                        "count_queue": count_queue,
+                        "use_fsync": True,
+                    }
+
+                    if use_msc:
+                        # Remove the inspect after the test_async_save.py is fixed.
+                        signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
+                        if len(signature.parameters) > 6:
+                            kwargs["use_msc"] = use_msc
+
+                    p_list.append(
+                        ctx.Process(
+                            target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
+                            kwargs=kwargs,
+                        )
+                    )
+                except Exception as e:
+                    tb_str = traceback.format_exc()
+                    err_msg = f"An error is caught while a proc {i} is created at rank {rank}:\n{tb_str}"
+                    logger.error(err_msg)
+                    write_results_or_exc = RuntimeError(err_msg)
+
+            if not isinstance(write_results_or_exc, Exception):
+                for p in p_list:
+                    p.start()
+
+                logger.debug("FileSystemWriterAsync: collecting worker results...")
+
+                # To make sure all nodes are completed
+                count_queue.join()
+                # At this point, all workers completed, so the queue should have exactly
+                # `len(write_buckets)` items
+                for proc_idx in range(len(write_buckets)):
+                    try:
+                        local_proc_idx, local_results_or_exc = local_results_queue.get()
+                    except queue.Empty:
+                        write_results_or_exc = RuntimeError(
+                            "Unexpected empty `local_results_queue`"
+                            f" (got only {proc_idx}/{len(write_buckets)} items)"
+                        )
+                        break
+                    else:
+                        if isinstance(local_results_or_exc, Exception):
+                            err_msg = (
+                                f"Local process {local_proc_idx} encountered"
+                                f" an error: {local_results_or_exc}"
+                            )
+                            logger.error(err_msg)
+                            write_results_or_exc = local_results_or_exc
+                            break
+                        assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
+                        write_results_or_exc[local_proc_idx] = local_results_or_exc
+                        p_list[local_proc_idx].join()
+
+                logger.debug("FileSystemWriterAsync: collected worker results successfully")
 
         global_results_queue.put(write_results_or_exc)
 
@@ -403,8 +454,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                         os.fsync(stream.fileno())
             local_output = (local_proc_idx, local_results)
         except Exception as e:
-            logger.debug(f"{local_proc_idx} failed")
-            local_output = (local_proc_idx, e)  # type: ignore[assignment]
+            # Capture full traceback for better debugging
+            tb_str = traceback.format_exc()
+            err_msg = f"Worker {local_proc_idx} failed with exception:\n{tb_str}"
+            logger.error(err_msg)
+            # Create a new exception with the traceback embedded in the message
+            exc_with_tb = RuntimeError(err_msg)
+            local_output = (local_proc_idx, exc_with_tb)  # type: ignore[assignment]
 
         results_queue.put(local_output)
         # Signal this process is done.
