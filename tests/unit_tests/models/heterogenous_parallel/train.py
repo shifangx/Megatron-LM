@@ -215,7 +215,7 @@ if __name__ == "__main__":
 
     # Profiling configuration
     enable_profiling = True
-    use_pytorch_profiler = True  # Set to True for PyTorch profiler, False for CUDA profiler
+    use_pytorch_profiler = False  # Set to True for PyTorch profiler, False for CUDA profiler
     tensorboard_dir = "./tb_logs"  # TensorBoard output directory (only for PyTorch profiler)
     num_iterations = 6
     profile_start_step = 3
