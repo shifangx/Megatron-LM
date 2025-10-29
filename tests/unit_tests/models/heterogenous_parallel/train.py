@@ -67,7 +67,8 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     vision_tp, vision_pp, vision_dp,
     language_tp, language_pp, language_dp,
     batch_size, num_microbatches,
-    num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False
+    num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False,
+    use_pytorch_profiler=False, tensorboard_dir=None
 ):
     """Test 1F1B schedule with VLM MIMO model using custom process groups.
     
@@ -151,13 +152,33 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     # Get pg collections for modules that should be initialized on this rank
     pg_collection = get_pg_collections_for_rank(module_to_grid_map)
     
+    # Initialize PyTorch profiler if requested
+    prof = None
+    if enable_profiling and use_pytorch_profiler:
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(
+                wait=max(profile_start_step - 1, 0) if profile_start_step else 0,
+                warmup=1 if profile_start_step and profile_start_step > 0 else 0,
+                active=(profile_end_step - profile_start_step) if profile_start_step and profile_end_step else num_iterations,
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(tensorboard_dir) if tensorboard_dir else None,
+            record_shapes=True,
+            with_stack=True,
+        )
+        prof.start()
+    
     all_losses = []
     
     for iteration in range(num_iterations):
-        # Start profiling if enabled
-        if enable_profiling and profile_start_step is not None and iteration == profile_start_step:
-            logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
-            torch.cuda.cudart().cudaProfilerStart()
+        # Handle profiling
+        if enable_profiling:
+            if use_pytorch_profiler:
+                if prof:
+                    prof.step()
+            elif profile_start_step is not None and iteration == profile_start_step:
+                logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
+                torch.cuda.cudart().cudaProfilerStart()
         
         logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Starting 1F1B schedule...")
         
@@ -173,10 +194,15 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         
         zero_grad_buffer_for_multimodule(module_to_grid_tuple)
         
-        # Stop profiling if enabled
-        if enable_profiling and profile_end_step is not None and iteration == profile_end_step:
-            logging.info(f"Rank {dist.get_rank()}: Stopping profiler at iteration {iteration}")
-            torch.cuda.cudart().cudaProfilerStop()
+        # Stop CUDA profiling if enabled
+        if enable_profiling and not use_pytorch_profiler:
+            if profile_end_step is not None and iteration == profile_end_step:
+                logging.info(f"Rank {dist.get_rank()}: Stopping profiler at iteration {iteration}")
+                torch.cuda.cudart().cudaProfilerStop()
+    
+    # Stop PyTorch profiler if running
+    if prof:
+        prof.stop()
     
     logging.info(f"Rank {dist.get_rank()}: Training completed. All losses: {all_losses}")
     
@@ -189,6 +215,8 @@ if __name__ == "__main__":
 
     # Profiling configuration
     enable_profiling = True
+    use_pytorch_profiler = True  # Set to True for PyTorch profiler, False for CUDA profiler
+    tensorboard_dir = "./tb_logs"  # TensorBoard output directory (only for PyTorch profiler)
     num_iterations = 6
     profile_start_step = 3
     profile_end_step = 5
@@ -234,6 +262,8 @@ if __name__ == "__main__":
         profile_start_step=profile_start_step,
         profile_end_step=profile_end_step,
         enable_profiling=enable_profiling,
+        use_pytorch_profiler=use_pytorch_profiler,
+        tensorboard_dir=tensorboard_dir,
     )
     logging.info(f"Final losses: {losses}")
 
