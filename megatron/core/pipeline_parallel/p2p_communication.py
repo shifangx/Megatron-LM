@@ -255,7 +255,7 @@ class P2PCommunicator:
 
             # To protect against race condition when using batch_isend_irecv().
             # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
