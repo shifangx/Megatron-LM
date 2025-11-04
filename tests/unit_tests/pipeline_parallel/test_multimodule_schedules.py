@@ -495,7 +495,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
         return model_output, loss_func
 
     sequence_length = 512
-    micro_batch_size = 1
+    micro_batch_size = 4
     hidden_size = 1024
 
     # Create model
@@ -604,7 +604,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_dual_enco
         return model_output, loss_func
 
     sequence_length = 512
-    micro_batch_size = 1
+    micro_batch_size = 4
     hidden_size = 1024
 
     # Create model
@@ -697,11 +697,11 @@ if __name__ == "__main__":
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
     test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
         mock_mocker, 
-        encoder_tp=2, 
-        encoder_pp=2, 
+        encoder_tp=4, 
+        encoder_pp=1, 
         encoder_dp=1, 
         llm_tp=2, 
-        llm_pp=2, 
-        llm_dp=1, 
+        llm_pp=1, 
+        llm_dp=2, 
         llm_grid_offset=4
     )
