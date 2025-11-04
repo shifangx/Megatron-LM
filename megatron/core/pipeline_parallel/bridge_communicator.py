@@ -433,7 +433,7 @@ class BridgeCommunicator:
                 received_gradients_list.append(grad_tensor)
 
             # Concatenate received gradients
-            aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+            aggregated_gradient = torch.cat(received_gradients_list, dim=self.dim_mapping['b'])
             shape_tensor = torch.tensor(
                 aggregated_gradient.shape, device=torch.cuda.current_device(), dtype=torch.int64
             )
@@ -525,7 +525,7 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received gradients
-                aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+                aggregated_gradient = torch.cat(received_gradients_list, dim=self.dim_mapping['b'])
                 # Broadcast tensor shape to all ranks in scatter_pg
                 tensor_shape_to_broadcast = aggregated_gradient.shape
                 shape_tensor = torch.tensor(
@@ -627,7 +627,7 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received activations
-                aggregated_activation = torch.cat(received_activations_list, dim=0)
+                aggregated_activation = torch.cat(received_activations_list, dim=self.dim_mapping['b'])
 
                 # Broadcast tensor shape to all ranks in scatter_pg
                 tensor_shape_to_scatter = aggregated_activation.shape
