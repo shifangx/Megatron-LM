@@ -30,7 +30,7 @@ def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_col
     lm_config = TransformerConfig(
         num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
         cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl='native',
+        cross_entropy_fusion_impl='te',
     )
     language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
     language_model_spec = ModuleSpec(
