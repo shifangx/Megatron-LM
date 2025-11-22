@@ -1,110 +1,72 @@
 """
-DP-Aware Data Iterator for Heterogeneous Multi-Module Training
+Hybrid DP-Aware Data Iterator for Heterogeneous Multi-Module Training
 
-This module provides a minimal, focused implementation of DP-aware data loading
-for MIMO models with heterogeneous Data Parallel configurations.
-
-Key Principle:
-    Given base_batch_size (LLM's micro-batch per DP replica), automatically:
-    1. Calculate global_batch = base_batch_size × llm_dp_size
-    2. Calculate encoder_batch = global_batch / encoder_dp_size
-    3. Ensure DP replicas within same module get non-overlapping data
+Simplified implementation that works directly with grids to create
+DP-aware data loaders for MIMO models.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Iterator
+from typing import Dict, Optional, Any, Iterator, List
 import logging
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler, DataLoader
 from examples.mimo.data.mock import MockVLMDataset
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from tests.unit_tests.models.heterogenous_parallel.config import DataConfig, ModelConfig
 
 
-@dataclass
-class ModuleDPInfo:
-    """DP configuration for a single module.
-    
-    Attributes:
-        dp_size: Data parallel size for this module
-        dp_rank: Data parallel rank within this module
-        micro_batch_size: Micro-batch size for this module (samples per DP replica)
-    """
-    dp_size: int
-    dp_rank: int
-    micro_batch_size: int
 
 
-def _get_dp_info_from_grid(grid) -> tuple[int, int]:
-    """Get DP size and rank from grid's DP process group.
+def validate_heterogeneous_batch_config(
+    model_config: ModelConfig,
+    data_config: DataConfig,
+) -> int:
+    """Validate that batch configuration is compatible with DP sizes across modules.
     
     Args:
-        grid: HyperCommGrid with DP process group
+        model_config: Model configuration with parallelism settings
+        data_config: Data configuration with base_batch_size
         
     Returns:
-        Tuple of (dp_size, dp_rank), or (1, 0) if no DP dimension
-    """
-    try:
-        dp_pg = grid.get_pg("dp")
-        if dp_pg is not None:
-            return dp_pg.size(), dist.get_rank(dp_pg)
-    except (AttributeError, KeyError):
-        pass
-    return 1, 0
-
-
-def calculate_module_batch_sizes(
-    module_to_grid_map: Dict[str, any],
-    base_batch_size: int,
-    llm_module_name: str = 'language_module'
-) -> Dict[str, ModuleDPInfo]:
-    """Calculate DP-aware batch sizes for all modules.
-    
-    Starting from the LLM's base_batch_size (micro-batch per DP replica),
-    calculates the global batch and derives each module's micro-batch size.
-    
-    Args:
-        module_to_grid_map: Maps module names to their HyperCommGrids
-        base_batch_size: LLM's micro-batch size per DP replica
-        llm_module_name: Name of the LLM module (default: 'language_module')
-        
-    Returns:
-        Dictionary mapping module names to their ModuleDPInfo
+        global_batch_size: The validated global batch size
         
     Raises:
-        ValueError: If batch size calculation results in non-integer values
+        ValueError: If batch configuration is invalid for any module's DP size
     """
-    # Step 1: Get LLM's DP configuration
-    llm_grid = module_to_grid_map[llm_module_name]
-    llm_dp_size, llm_dp_rank = _get_dp_info_from_grid(llm_grid)
+    # Get LLM DP size and calculate global batch
+    llm_parallelism = model_config.get_parallelism(model_config.llm_module_name)
+    llm_dp_size = llm_parallelism.data_parallel
+    global_batch_size = data_config.base_batch_size * llm_dp_size
     
-    # Step 2: Calculate global batch per microbatch
-    global_batch_per_microbatch = base_batch_size * llm_dp_size
-    
-    # Step 3: Calculate batch sizes for all modules
-    module_dp_info = {}
-    
-    for module_name, grid in module_to_grid_map.items():
-        dp_size, dp_rank = _get_dp_info_from_grid(grid)
+    # Validate all modules can split the global batch evenly
+    for module_name in model_config.module_parallelisms.keys():
+        module_parallelism = model_config.get_parallelism(module_name)
+        dp_size = module_parallelism.data_parallel
         
-        # Calculate micro-batch size for this module
-        if global_batch_per_microbatch % dp_size != 0:
+        if global_batch_size % dp_size != 0:
             raise ValueError(
                 f"Invalid DP configuration for module '{module_name}': "
-                f"global_batch ({global_batch_per_microbatch}) must be divisible by "
+                f"global_batch_size ({global_batch_size}) must be divisible by "
                 f"dp_size ({dp_size}). "
-                f"LLM: base_batch={base_batch_size}, dp={llm_dp_size}"
+                f"LLM: base_batch_size={data_config.base_batch_size}, dp_size={llm_dp_size}. "
+                f"Consider adjusting base_batch_size or DP configurations."
             )
         
-        micro_batch_size = global_batch_per_microbatch // dp_size
+        micro_batch_size = global_batch_size // dp_size
         
-        module_dp_info[module_name] = ModuleDPInfo(
-            dp_size=dp_size,
-            dp_rank=dp_rank,
-            micro_batch_size=micro_batch_size
+        if dist.get_rank() == 0:
+            logging.info(
+                f"Module '{module_name}': DP={dp_size}, "
+                f"micro_batch_size={micro_batch_size} (per DP replica)"
+            )
+    
+    if dist.get_rank() == 0:
+        logging.info(
+            f"Validated batch config: base_batch={data_config.base_batch_size}, "
+            f"global_batch={global_batch_size}, num_microbatches={data_config.num_microbatches}"
         )
     
-    return module_dp_info
+    return global_batch_size
 
 
 class HeterogeneousDPBatchSampler(Sampler):
@@ -112,11 +74,6 @@ class HeterogeneousDPBatchSampler(Sampler):
     
     Ensures different DP replicas within the same module receive non-overlapping
     data while respecting module-specific batch sizes.
-    
-    Example:
-        With global_batch=8, dp_rank=0, dp_size=2, micro_batch=4:
-        - DP rank 0: indices [0,2,4,6] (every 2nd sample starting from 0)
-        - DP rank 1: indices [1,3,5,7] (every 2nd sample starting from 1)
     """
     
     def __init__(
@@ -157,7 +114,6 @@ class HeterogeneousDPBatchSampler(Sampler):
             end_idx = min(start_idx + self.global_batch_size, self.dataset_size)
             
             # Shard for this DP rank
-            # Each DP replica gets every dp_size-th sample starting from dp_rank
             my_indices = list(range(
                 start_idx + self.dp_rank,
                 end_idx,
@@ -175,109 +131,18 @@ class HeterogeneousDPBatchSampler(Sampler):
         return self.num_batches
 
 
-class DPAwareDataIterator:
-    """DP-aware data iterator with configuration logging."""
-    
-    def __init__(
-        self,
-        module_to_grid_map: Dict[str, Any],
-        base_batch_size: int,
-        num_microbatches: int,
-        llm_module_name: str = 'language_module'
-    ):
-        """
-        Args:
-            module_to_grid_map: Maps module names to their HyperCommGrids
-            base_batch_size: LLM's micro-batch size per DP replica
-            num_microbatches: Number of microbatches for gradient accumulation
-            llm_module_name: Name of the LLM module
-        """
-        self.module_to_grid_map = module_to_grid_map
-        self.base_batch_size = base_batch_size
-        self.num_microbatches = num_microbatches
-        self.llm_module_name = llm_module_name
-        
-        # Calculate DP info for all modules
-        self.module_dp_info = calculate_module_batch_sizes(
-            module_to_grid_map, base_batch_size, llm_module_name
-        )
-        
-        # Calculate global batch size
-        llm_dp_size = self.module_dp_info[llm_module_name].dp_size
-        self.global_batch_size = base_batch_size * llm_dp_size
-        
-        # Log configuration
-        self._log_configuration()
-    
-    def _log_configuration(self):
-        """Log the DP configuration for all modules."""
-        if dist.get_rank() == 0:
-            effective_global_batch = self.global_batch_size * self.num_microbatches
-            
-            logging.info("=" * 60)
-            logging.info("DP-Aware Data Iterator Configuration")
-            logging.info("=" * 60)
-            logging.info(f"Base batch size (LLM per DP replica): {self.base_batch_size}")
-            logging.info(f"Global batch per microbatch: {self.global_batch_size}")
-            logging.info(f"Number of microbatches: {self.num_microbatches}")
-            logging.info(f"Effective global batch: {effective_global_batch}")
-            logging.info("-" * 60)
-            
-            for module_name, dp_info in self.module_dp_info.items():
-                total_per_iteration = dp_info.micro_batch_size * self.num_microbatches
-                logging.info(
-                    f"{module_name:20s} | DP={dp_info.dp_size} | "
-                    f"micro_batch={dp_info.micro_batch_size:3d} | "
-                    f"total/iter={total_per_iteration:4d}"
-                )
-            
-            logging.info("=" * 60)
-    
-    def get_dp_info_for_current_rank(self) -> Optional[ModuleDPInfo]:
-        """Get DP info for the current rank's module.
-        
-        Returns:
-            ModuleDPInfo for the current rank's module, or None if rank not in any grid
-        """
-        current_rank = dist.get_rank()
-        
-        # Find which module this rank belongs to
-        for module_name, grid in self.module_to_grid_map.items():
-            if grid.rank_offset <= current_rank < (grid.rank_offset + grid.size):
-                return self.module_dp_info[module_name]
-        
-        return None
-
-
-# ==============================================================================
-# Data Iterator Functions
-# ==============================================================================
-
-
 def _collate_fn(
     batch: List[Dict], 
     image_seq_length: int = 1024, 
     hidden_size: int = 1024
 ) -> Dict[str, torch.Tensor]:
-    """Collate function for the DataLoader.
-    
-    Args:
-        batch: List of dictionaries from the dataset
-        image_seq_length: Sequence length for image tokens
-        hidden_size: Hidden size for the vision encoder output
-        
-    Returns:
-        Dictionary of batched tensors
-    """
+    """Collate function for the DataLoader."""
     input_ids = torch.stack([item["input_ids"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     loss_mask = torch.stack([item["loss_mask"] for item in batch])
     position_ids = torch.stack([item["position_ids"] for item in batch])
     
     bsz = input_ids.shape[0]
-    
-    # Pre-allocate on pinned memory for faster GPU transfer
-    # Using torch.zeros instead of randn is much faster if acceptable for testing
     hidden_states = torch.zeros(image_seq_length, bsz, hidden_size, dtype=torch.bfloat16)
     
     return {
@@ -294,17 +159,7 @@ def _collate_fn(
 
 
 def move_to_device(data, device):
-    """Recursively move tensors in nested dicts to device with non_blocking for async transfers.
-    
-    When pin_memory=True in DataLoader, non_blocking=True enables async GPU transfers.
-    
-    Args:
-        data: Data to move (tensor, dict, list, or other)
-        device: Target device
-        
-    Returns:
-        Data moved to device
-    """
+    """Recursively move tensors in nested dicts to device with non_blocking for async transfers."""
     if isinstance(data, torch.Tensor):
         return data.to(device, non_blocking=True)
     elif isinstance(data, dict):
@@ -315,79 +170,50 @@ def move_to_device(data, device):
 
 
 def get_data_iterator(
+    model_config: ModelConfig,
+    data_config: DataConfig,
     module_to_grid_map: Dict[str, Any],
-    base_batch_size: int,
-    image_seq_length: int,
-    seq_length: int,
-    image_special_token_id: int,
-    vocab_size: int,
-    vision_hidden_size: int,
-    num_microbatches: int = 1,
-    encoder_module_name: str = 'images',
-    llm_module_name: str = 'language_module',
-    dataset_size: int = 256,
-    num_workers: int = 8,
-    prefetch_factor: int = 4,
-):
+) -> Optional[Iterator]:
     """Create DP-aware data iterator for heterogeneous multi-module training.
     
-    This is the main entry point for creating data iterators with automatic
-    DP-aware batch sizing based on module configurations.
-    
     Args:
+        model_config: Model configuration with parallelism settings
+        data_config: Data configuration (batch sizes, dataset params)
         module_to_grid_map: Maps module names to their HyperCommGrids
-        base_batch_size: LLM's micro-batch size per DP replica
-        image_seq_length: Sequence length for image tokens
-        seq_length: Total sequence length
-        image_special_token_id: Special token ID for images
-        vocab_size: Vocabulary size
-        vision_hidden_size: Hidden size for vision encoder
-        num_microbatches: Number of microbatches (for logging only)
-        encoder_module_name: Name of encoder module (default: 'images')
-        llm_module_name: Name of LLM module (default: 'language_module')
-        dataset_size: Size of the dataset (default: 256)
-        num_workers: Number of DataLoader workers (default: 8)
-        prefetch_factor: Prefetch batches per worker (default: 4)
         
     Returns:
-        Data iterator configured for this rank's module, or None if rank not involved
+        Data iterator for this rank's module, or None if rank not involved
         
-    Example:
-        >>> data_iterator = get_data_iterator(
-        ...     module_to_grid_map={'images': encoder_grid, 'language_module': llm_grid},
-        ...     base_batch_size=8,
-        ...     image_seq_length=256,
-        ...     seq_length=1024,
-        ...     image_special_token_id=32000,
-        ...     vocab_size=4000,
-        ...     vision_hidden_size=768,
-        ...     num_microbatches=4,
-        ... )
+    Raises:
+        ValueError: If batch configuration is incompatible with DP sizes
     """
-    # Create DP-aware iterator manager (logs configuration)
-    dp_iterator = DPAwareDataIterator(
-        module_to_grid_map, 
-        base_batch_size, 
-        num_microbatches, 
-        llm_module_name
+    # Validate batch configuration and get global batch size
+    global_batch_size = validate_heterogeneous_batch_config(
+        model_config=model_config,
+        data_config=data_config,
     )
     
-    # Get DP info for current rank's module
-    dp_info = dp_iterator.get_dp_info_for_current_rank()
+    # Find current rank's grid and get DP info
+    current_rank = dist.get_rank()
+    my_grid = None
+    for grid in module_to_grid_map.values():
+        if grid.rank_offset <= current_rank < (grid.rank_offset + grid.size):
+            my_grid = grid
+            break
     
-    if dp_info is None:
+    if my_grid is None:
         return None
     
-    # Check if we should initialize iterator on this rank
-    # Initialize on first PP stage of encoders and LLM first/last stages
-    encoder_grid = module_to_grid_map.get(encoder_module_name)
-    llm_grid = module_to_grid_map.get(llm_module_name)
+    # Get DP info from current rank's grid
+    dp_size, dp_rank = my_grid.get_pg("dp").size(), my_grid.get_pg("dp").rank()
     
-    # Helper function to check if current rank is in grid
+    # Check if we should initialize iterator on this rank
+    encoder_grid = module_to_grid_map.get(model_config.encoder_module_name)
+    llm_grid = module_to_grid_map.get(model_config.llm_module_name)
+    
     def is_rank_in_grid(grid):
         if grid is None:
             return False
-        current_rank = dist.get_rank()
         return grid.rank_offset <= current_rank < (grid.rank_offset + grid.size)
     
     encoder_condition = (
@@ -402,46 +228,50 @@ def get_data_iterator(
         (is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp")))
     )
     
-    if encoder_condition or llm_condition:
-        # Create dataset
-        dataset = MockVLMDataset(
-            size=dataset_size,
-            image_size=224,
-            seq_len=seq_length,
-            image_seq_length=image_seq_length,
-            pad_token_id=0,
-            image_token_id=image_special_token_id
-        )
-        
-        # Create DP-aware batch sampler with global batch size
-        batch_sampler = HeterogeneousDPBatchSampler(
-            dataset_size=len(dataset),
-            global_batch_size=dp_iterator.global_batch_size,
-            dp_rank=dp_info.dp_rank,
-            dp_size=dp_info.dp_size,
-            drop_last=True
-        )
-        
-        # Create DataLoader with DP-aware sampler
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            collate_fn=lambda batch: _collate_fn(
-                batch, 
-                image_seq_length=image_seq_length, 
-                hidden_size=vision_hidden_size
-            ),
-            pin_memory=True,  # Enables fast CPU->GPU transfers
-            persistent_workers=True,  # Keep workers alive between epochs
-            prefetch_factor=prefetch_factor,  # Prefetch batches per worker
-        )
-        return iter(dataloader)
+    if not (encoder_condition or llm_condition):
+        return None
     
-    return None
+    # Create dataset
+    dataset = MockVLMDataset(
+        size=data_config.dataset_size,
+        image_size=224,
+        seq_len=data_config.seq_length,
+        image_seq_length=data_config.image_seq_length,
+        pad_token_id=0,
+        image_token_id=data_config.image_special_token_id
+    )
+    
+    # Create DP-aware batch sampler
+    batch_sampler = HeterogeneousDPBatchSampler(
+        dataset_size=len(dataset),
+        global_batch_size=global_batch_size,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        drop_last=True
+    )
+    
+    # Get vision hidden size from model config
+    vision_hidden_size = model_config.get_arch(model_config.encoder_module_name).hidden_size
+    
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=data_config.num_workers,
+        collate_fn=lambda batch: _collate_fn(
+            batch, 
+            image_seq_length=data_config.image_seq_length, 
+            hidden_size=vision_hidden_size
+        ),
+        pin_memory=data_config.pin_memory,
+        persistent_workers=data_config.persistent_workers,
+        prefetch_factor=data_config.prefetch_factor,
+    )
+    
+    return iter(dataloader)
 
 
-def get_batch(data_iterator: Iterator[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def get_batch(data_iterator: Optional[Iterator]) -> Optional[Dict[str, Any]]:
     """Get next batch from data iterator and move to GPU.
     
     Args:
@@ -454,7 +284,5 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]) -> Optional[Dict[str, Any
         input_tensor = next(data_iterator)
         if input_tensor is not None:
             input_tensor = move_to_device(input_tensor, torch.device("cuda"))
-    else:
-        input_tensor = None
-    
-    return input_tensor
+        return input_tensor
+    return None

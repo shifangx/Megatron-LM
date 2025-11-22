@@ -10,11 +10,14 @@ import torch.distributed as dist
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.pipeline_parallel.test_multimodule_schedules import create_hypercomm_grid
 from tests.unit_tests.models.heterogenous_parallel.dp_aware_data_iterator import (
-    extract_dp_from_grid,
-    calculate_module_batch_sizes,
-    get_module_dp_info_for_rank,
+    validate_heterogeneous_batch_config,
     HeterogeneousDPBatchSampler,
-    log_dp_configuration,
+)
+from tests.unit_tests.models.heterogenous_parallel.config import (
+    DataConfig,
+    ModelConfig,
+    ModuleArchConfig,
+    ModuleParallelismConfig,
 )
 
 
@@ -36,23 +39,50 @@ def test_scenario_1():
     base_batch_size = 8
     num_microbatches = 4
     
-    # Log configuration
-    log_dp_configuration(module_to_grid_map, base_batch_size, num_microbatches)
+    # Create model config
+    model_config = ModelConfig(
+        module_architectures={
+            'images': ModuleArchConfig(num_layers=4, hidden_size=768, num_attention_heads=4, seq_length=256, vocab_size=0),
+            'language_module': ModuleArchConfig(num_layers=4, hidden_size=768, num_attention_heads=4, seq_length=1024, vocab_size=4000),
+        },
+        module_parallelisms={
+            'images': ModuleParallelismConfig(tensor_parallel=2, pipeline_parallel=1, data_parallel=2),
+            'language_module': ModuleParallelismConfig(tensor_parallel=2, pipeline_parallel=2, data_parallel=1),
+        },
+        special_token_ids={'images': 32000},
+    )
     
-    # Calculate batch sizes
-    dp_info_map = calculate_module_batch_sizes(module_to_grid_map, base_batch_size)
+    # Create data config
+    data_config = DataConfig(
+        base_batch_size=base_batch_size,
+        num_microbatches=num_microbatches,
+        seq_length=1024,
+        image_seq_length=256,
+        image_special_token_id=32000,
+        vocab_size=4000,
+    )
     
-    # Verify calculations
+    # Validate configuration
+    global_batch_size = validate_heterogeneous_batch_config(
+        model_config=model_config,
+        data_config=data_config,
+    )
+    
     rank = dist.get_rank()
     
     if rank == 0:
+        # With base_batch=8 and llm_dp=1, global_batch per microbatch = 8
+        assert global_batch_size == 8, f"Expected global_batch=8, got {global_batch_size}"
+        
         # Encoder should have micro_batch=4 (global_batch=8 / encoder_dp=2)
-        assert dp_info_map['images'].micro_batch_size == 4, \
-            f"Expected encoder micro_batch=4, got {dp_info_map['images'].micro_batch_size}"
+        encoder_dp_size = model_config.get_parallelism('images').data_parallel
+        encoder_micro_batch = global_batch_size // encoder_dp_size
+        assert encoder_micro_batch == 4, f"Expected encoder micro_batch=4, got {encoder_micro_batch}"
         
         # LLM should have micro_batch=8 (global_batch=8 / llm_dp=1)
-        assert dp_info_map['language_module'].micro_batch_size == 8, \
-            f"Expected llm micro_batch=8, got {dp_info_map['language_module'].micro_batch_size}"
+        llm_dp_size = model_config.get_parallelism('language_module').data_parallel
+        llm_micro_batch = global_batch_size // llm_dp_size
+        assert llm_micro_batch == 8, f"Expected llm micro_batch=8, got {llm_micro_batch}"
         
         print("✓ Scenario 1: Batch size calculations correct")
     
@@ -82,23 +112,50 @@ def test_scenario_2():
     base_batch_size = 16
     num_microbatches = 2
     
-    # Log configuration
-    log_dp_configuration(module_to_grid_map, base_batch_size, num_microbatches)
+    # Create model config
+    model_config = ModelConfig(
+        module_architectures={
+            'images': ModuleArchConfig(num_layers=4, hidden_size=768, num_attention_heads=4, seq_length=256, vocab_size=0),
+            'language_module': ModuleArchConfig(num_layers=4, hidden_size=768, num_attention_heads=4, seq_length=1024, vocab_size=4000),
+        },
+        module_parallelisms={
+            'images': ModuleParallelismConfig(tensor_parallel=1, pipeline_parallel=1, data_parallel=1),
+            'language_module': ModuleParallelismConfig(tensor_parallel=1, pipeline_parallel=1, data_parallel=4),
+        },
+        special_token_ids={'images': 32000},
+    )
     
-    # Calculate batch sizes
-    dp_info_map = calculate_module_batch_sizes(module_to_grid_map, base_batch_size)
+    # Create data config
+    data_config = DataConfig(
+        base_batch_size=base_batch_size,
+        num_microbatches=num_microbatches,
+        seq_length=1024,
+        image_seq_length=256,
+        image_special_token_id=32000,
+        vocab_size=4000,
+    )
     
-    # Verify calculations
+    # Validate configuration
+    global_batch_size = validate_heterogeneous_batch_config(
+        model_config=model_config,
+        data_config=data_config,
+    )
+    
     rank = dist.get_rank()
     
     if rank == 0:
+        # With base_batch=16 and llm_dp=4, global_batch per microbatch = 64
+        assert global_batch_size == 64, f"Expected global_batch=64, got {global_batch_size}"
+        
         # Encoder should have micro_batch=64 (global_batch=64 / encoder_dp=1)
-        assert dp_info_map['images'].micro_batch_size == 64, \
-            f"Expected encoder micro_batch=64, got {dp_info_map['images'].micro_batch_size}"
+        encoder_dp_size = model_config.get_parallelism('images').data_parallel
+        encoder_micro_batch = global_batch_size // encoder_dp_size
+        assert encoder_micro_batch == 64, f"Expected encoder micro_batch=64, got {encoder_micro_batch}"
         
         # LLM should have micro_batch=16 (global_batch=64 / llm_dp=4)
-        assert dp_info_map['language_module'].micro_batch_size == 16, \
-            f"Expected llm micro_batch=16, got {dp_info_map['language_module'].micro_batch_size}"
+        llm_dp_size = model_config.get_parallelism('language_module').data_parallel
+        llm_micro_batch = global_batch_size // llm_dp_size
+        assert llm_micro_batch == 16, f"Expected llm micro_batch=16, got {llm_micro_batch}"
         
         print("✓ Scenario 2: Batch size calculations correct")
     
@@ -145,68 +202,16 @@ def test_dp_sampler():
     dist.barrier()
 
 
-def test_get_module_dp_info_for_rank():
-    """Test getting DP info for current rank"""
-    print("\n" + "="*60)
-    print("Test get_module_dp_info_for_rank")
-    print("="*60)
-    
-    # Create grids
-    encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=2)
-    llm_grid = create_hypercomm_grid(offset=2, tp=1, cp=1, pp=1, dp=1)
-    
-    module_to_grid_map = {
-        'images': encoder_grid,
-        'language_module': llm_grid,
-    }
-    
-    base_batch_size = 8
-    rank = dist.get_rank()
-    
-    # Get DP info for current rank
-    dp_info = get_module_dp_info_for_rank(
-        module_to_grid_map,
-        base_batch_size,
-        current_rank=rank
-    )
-    
-    if rank < 2:
-        # Ranks 0-1 should be in encoder with micro_batch=4
-        assert dp_info is not None, f"Rank {rank} should have DP info"
-        assert dp_info.micro_batch_size == 4, \
-            f"Rank {rank} (encoder) should have micro_batch=4, got {dp_info.micro_batch_size}"
-        print(f"✓ Rank {rank} (encoder): micro_batch={dp_info.micro_batch_size}, dp_rank={dp_info.dp_rank}")
-    
-    elif rank == 2:
-        # Rank 2 should be in LLM with micro_batch=8
-        assert dp_info is not None, f"Rank {rank} should have DP info"
-        assert dp_info.micro_batch_size == 8, \
-            f"Rank {rank} (llm) should have micro_batch=8, got {dp_info.micro_batch_size}"
-        print(f"✓ Rank {rank} (llm): micro_batch={dp_info.micro_batch_size}, dp_rank={dp_info.dp_rank}")
-    
-    dist.barrier()
-
-
 if __name__ == "__main__":
     # Initialize distributed training
     Utils.initialize_distributed()
     test_scenario_1()
     test_scenario_2()
     test_dp_sampler()
-    test_get_module_dp_info_for_rank()
 
-    dist.destroy_process_group()
-
-    # try:
-    #     test_scenario_1()
-    #     test_scenario_2()
-    #     test_dp_sampler()
-    #     test_get_module_dp_info_for_rank()
-        
-    #     if dist.get_rank() == 0:
-    #         print("\n" + "="*60)
-    #         print("All tests passed! ✓")
-    #         print("="*60)
+    if dist.get_rank() == 0:
+        print("\n" + "="*60)
+        print("All tests passed! ✓")
+        print("="*60)
     
-    # finally:
-    #     dist.destroy_process_group()
+    dist.destroy_process_group()

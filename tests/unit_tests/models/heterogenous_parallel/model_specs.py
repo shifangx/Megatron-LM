@@ -12,8 +12,9 @@ from examples.mimo.configs.llava_vlm import get_llava_projection_layer_spec, get
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from tests.unit_tests.pipeline_parallel.test_multimodule_schedules import create_hypercomm_grid, _get_pg_collection_with_embedding_groups
+from tests.unit_tests.models.heterogenous_parallel.config import ModelConfig
 
-def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_collection):
+def get_language_model_spec(num_layers, hidden_size, num_attention_heads, vocab_size, seq_len, pg_collection):
     """Get the language model spec."""
     # Determine pre_process and post_process based on PP rank
     pp_rank = dist.get_rank(pg_collection.pp)
@@ -28,7 +29,7 @@ def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_col
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
     
     lm_config = TransformerConfig(
-        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
+        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=num_attention_heads, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
     )
@@ -48,12 +49,13 @@ def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_col
     return language_model_spec
 
 
-def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg_collection):
+def get_vision_submodules_spec(num_layers, hidden_size, num_attention_heads, language_hidden_size, pg_collection):
     """Get the submodule spec for the vision modality.
     
     Args:
         num_layers: Number of transformer layers in vision encoder
         hidden_size: Hidden size of vision encoder
+        num_attention_heads: Number of attention heads in vision encoder
         language_hidden_size: Hidden size of language model (for projection output)
         pg_collection: Process group collection
     """
@@ -63,7 +65,7 @@ def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
 
     vision_config = TransformerConfig(
-        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
+        num_layers=num_layers, hidden_size=hidden_size, num_attention_heads=num_attention_heads, use_cpu_initialization=True, variable_seq_lengths=True, moe_token_dispatcher_type= 'alltoall', tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size, pipeline_dtype=torch.bfloat16, bf16=True,
     )
     vision_encoder_spec = ModuleSpec(
         module=TransformerBlock,
@@ -103,33 +105,74 @@ def get_vision_submodules_spec(num_layers, hidden_size, language_hidden_size, pg
 
 
 def get_vlm_mimo_model(
-    vision_num_layers, vision_hidden_size, language_num_layers, language_hidden_size, 
-    vocab_size, seq_len, special_token_ids, 
-    vision_tp, vision_pp, vision_dp,
-    language_tp, language_pp, language_dp
+    model_config: ModelConfig,
+    seq_len: int,
 ):
+    """Create VLM MIMO model from centralized config.
+    
+    Args:
+        model_config: Model configuration (architectures, parallelisms, special tokens)
+        seq_len: Sequence length for the language model
+        
+    Returns:
+        Tuple of (mimo_model, module_to_grid_map, topology)
+    """
+    # Extract configurations
+    vision_arch = model_config.get_arch(model_config.encoder_module_name)
+    llm_arch = model_config.get_arch(model_config.llm_module_name)
+    vision_parallel = model_config.get_parallelism(model_config.encoder_module_name)
+    llm_parallel = model_config.get_parallelism(model_config.llm_module_name)
+    
     # Calculate offsets for grids to avoid overlap (CP and EP are hardcoded to 1)
-    vision_grid_size = vision_tp * vision_pp * vision_dp
-    language_module_grid = create_hypercomm_grid(offset=vision_grid_size, tp=language_tp, cp=1, pp=language_pp, dp=language_dp)
+    vision_grid_size = vision_parallel.tensor_parallel * vision_parallel.pipeline_parallel * vision_parallel.data_parallel
+    language_module_grid = create_hypercomm_grid(
+        offset=vision_grid_size, 
+        tp=llm_parallel.tensor_parallel, 
+        cp=1, 
+        pp=llm_parallel.pipeline_parallel, 
+        dp=llm_parallel.data_parallel
+    )
     language_pg_collection = _get_pg_collection_with_embedding_groups(language_module_grid)
 
-    vision_module_grid = create_hypercomm_grid(offset=0, tp=vision_tp, cp=1, pp=vision_pp, dp=vision_dp)
+    vision_module_grid = create_hypercomm_grid(
+        offset=0, 
+        tp=vision_parallel.tensor_parallel, 
+        cp=1, 
+        pp=vision_parallel.pipeline_parallel, 
+        dp=vision_parallel.data_parallel
+    )
     vision_pg_collection = _get_pg_collection_with_embedding_groups(vision_module_grid)
 
-    language_model_spec = get_language_model_spec(language_num_layers, language_hidden_size, vocab_size, seq_len, language_pg_collection)
-    vision_submodule_spec = get_vision_submodules_spec(vision_num_layers, vision_hidden_size, language_hidden_size, vision_pg_collection)
+    language_model_spec = get_language_model_spec(
+        llm_arch.num_layers, 
+        llm_arch.hidden_size, 
+        llm_arch.num_attention_heads,
+        llm_arch.vocab_size, 
+        seq_len, 
+        language_pg_collection
+    )
+    vision_submodule_spec = get_vision_submodules_spec(
+        vision_arch.num_layers, 
+        vision_arch.hidden_size, 
+        vision_arch.num_attention_heads,
+        llm_arch.hidden_size, 
+        vision_pg_collection
+    )
 
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
-        modality_submodules_spec={"images": vision_submodule_spec,},
-        special_token_ids=special_token_ids,
+        modality_submodules_spec={model_config.encoder_module_name: vision_submodule_spec},
+        special_token_ids=model_config.special_token_ids,
     )
     # Create MIMO model
     mimo_model = MimoModel(mimo_config)
-    module_to_grid_map = {'images': vision_module_grid, 'language_module': language_module_grid}
+    module_to_grid_map = {
+        model_config.encoder_module_name: vision_module_grid, 
+        model_config.llm_module_name: language_module_grid
+    }
     topology = {
-        'images': ['language_module'],  # images sends forward results to language_module
-        'language_module': [],  # language_module is the last stage here
+        model_config.encoder_module_name: [model_config.llm_module_name],  # encoder sends to LLM
+        model_config.llm_module_name: [],  # LLM is the last stage
     }
 
 
@@ -143,7 +186,7 @@ def get_vlm_mimo_model(
         module=mimo_model.language_model,
         pg_collection=language_pg_collection
         )
-    submodule = mimo_model.modality_submodules['images']
+    submodule = mimo_model.modality_submodules[model_config.encoder_module_name]
 
     if submodule is not None:
         submodule = DistributedDataParallel(
@@ -152,6 +195,6 @@ def get_vlm_mimo_model(
             module=submodule,
             pg_collection=vision_pg_collection
         )
-    mimo_model.modality_submodules['images'] = submodule
+    mimo_model.modality_submodules[model_config.encoder_module_name] = submodule
 
     return mimo_model, module_to_grid_map, topology

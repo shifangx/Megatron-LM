@@ -1,3 +1,8 @@
+"""
+CUDA_VISIBLE_DEVICES=0,1 USE_PYTORCH_PROFILER=False nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o profile_output uv run python -m torch.distributed.run --nproc_per_node=2 tests/unit_tests/models/heterogenous_parallel/train.py
+uv run python -m torch.distributed.run --nproc_per_node=8 tests/unit_tests/models/heterogenous_parallel/train.py
+"""
+
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -13,12 +18,18 @@ from tests.unit_tests.models.heterogenous_parallel.parallel_utils import (
     multimodule_no_sync, 
     finalize_model_grads,
     get_pg_collections_for_rank,
-    zero_grad_buffer_for_multimodule
+    zero_grad_buffer_for_multimodule,
+    is_current_rank_in_grid,
 )
-from tests.unit_tests.models.heterogenous_parallel.data import get_data_iterator, get_batch
+from tests.unit_tests.models.heterogenous_parallel.dp_aware_data_iterator import get_data_iterator, get_batch
+from tests.unit_tests.models.heterogenous_parallel.performance_utils import create_performance_monitor
+from tests.unit_tests.models.heterogenous_parallel.config import (
+    ModelConfig, ModuleArchConfig, ModuleParallelismConfig,
+    DataConfig, RuntimeConfig
+)
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 import megatron.core.pipeline_parallel.schedules as schedule
-
+import os
 
 def loss_func(loss_mask, output_tensor):
     """Simple loss function for MIMO model training.
@@ -60,79 +71,63 @@ def forward_step(data_iterator, model):
 
 
 def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
-    vision_num_layers, vision_hidden_size, 
-    language_num_layers, language_hidden_size, 
-    vocab_size, image_seq_length, seq_length, 
-    special_token_ids,
-    vision_tp, vision_pp, vision_dp,
-    language_tp, language_pp, language_dp,
-    batch_size, num_microbatches,
-    num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False,
-    use_pytorch_profiler=False, tensorboard_dir=None
+    model_config: ModelConfig,
+    data_config: DataConfig,
+    runtime_config: RuntimeConfig,
 ):
-    """Test 1F1B schedule with VLM MIMO model using custom process groups.
+    """Test 1F1B schedule with VLM MIMO model using centralized configs.
     
     Args:
-        vision_num_layers: Number of layers in vision encoder
-        vision_hidden_size: Hidden size for vision encoder
-        language_num_layers: Number of layers in language model
-        language_hidden_size: Hidden size for language model
-        vocab_size: Vocabulary size
-        image_seq_length: Sequence length for images
-        seq_length: Total sequence length (text tokens = seq_length - image_seq_length)
-        special_token_ids: Dictionary of special token IDs
-        vision_tp, vision_pp, vision_dp: Vision model parallelism configs (TP, PP, DP)
-        language_tp, language_pp, language_dp: Language model parallelism configs (TP, PP, DP)
-        batch_size: Batch size for training
-        num_microbatches: Number of microbatches for pipeline parallelism
+        model_config: Model configuration (architectures, parallelisms)
+        data_config: Data configuration (batch sizes, dataset params)
+        runtime_config: Runtime configuration (iterations, profiling, etc)
     """
     logging.info("Creating VLM MIMO model...")
+    
+    # Create MIMO model using simplified interface
     mimo_model, module_to_grid_map, topology = get_vlm_mimo_model(
-        vision_num_layers=vision_num_layers,
-        vision_hidden_size=vision_hidden_size,
-        language_num_layers=language_num_layers,
-        language_hidden_size=language_hidden_size,
-        vocab_size=vocab_size,
-        seq_len=seq_length,
-        special_token_ids=special_token_ids,
-        vision_tp=vision_tp,
-        vision_pp=vision_pp,
-        vision_dp=vision_dp,
-        language_tp=language_tp,
-        language_pp=language_pp,
-        language_dp=language_dp,
+        model_config=model_config,
+        seq_len=data_config.seq_length,
     )
+    
+    # CRITICAL FIX: Disable barrier_with_L1_time for multimodule/heterogeneous setups
+    mimo_model.config.barrier_with_L1_time = False
     
     logging.info(f"Rank {dist.get_rank()}: Model created successfully")
     
     # Set up module to grid tuple for no_sync and finalize_model_grads
     module_to_grid_tuple = get_module_to_grid_tuple(
         mimo_model, 
-        module_to_grid_map['images'], 
-        module_to_grid_map['language_module']
+        module_to_grid_map[model_config.encoder_module_name], 
+        module_to_grid_map[model_config.llm_module_name]
     )
     
     # Configure no_sync and finalize_model_grads functions
     mimo_model.config.no_sync_func = partial(multimodule_no_sync, module_to_grid_tuple=module_to_grid_tuple)
     mimo_model.config.finalize_model_grads_func = partial(finalize_model_grads, module_to_grid_tuple=module_to_grid_tuple)
     
+    logging.info(f"Rank {dist.get_rank()}: Creating data iterator...")
+    
+    # Get data iterator using simplified interface
+    data_iterator = get_data_iterator(
+        model_config=model_config,
+        data_config=data_config,
+        module_to_grid_map=module_to_grid_map,
+    )
+    
+    # Create performance monitor using simplified interface
+    perf_monitor = create_performance_monitor(
+        model_config=model_config,
+        data_config=data_config,
+        runtime_config=runtime_config,
+        megatron_config=mimo_model.config,
+    )
+    
+    logging.info(f"Rank {dist.get_rank()}: Performance monitor initialized")
+    
     # Create multimodule communicator
     multimodule_communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, mimo_model.config, dim_mapping={'b': 0, 's': 1, 'h': 2}
-    )
-    
-    logging.info(f"Rank {dist.get_rank()}: Creating data iterator...")
-    
-    # Get data iterator
-    data_iterator = get_data_iterator(
-        encoder_grid=module_to_grid_map['images'],
-        llm_grid=module_to_grid_map['language_module'],
-        image_seq_length=image_seq_length,
-        seq_length=seq_length,
-        image_special_token_id=special_token_ids['images'],
-        batch_size=batch_size,
-        vocab_size=vocab_size,
-        vision_hidden_size=vision_hidden_size
     )
     
     # Set model type for unit test
@@ -143,9 +138,9 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         'forward_step_func': forward_step,
         'data_iterator': data_iterator,
         'model': [mimo_model],
-        'num_microbatches': num_microbatches,
-        'seq_length': seq_length,
-        'micro_batch_size': batch_size,
+        'num_microbatches': data_config.num_microbatches,
+        'seq_length': data_config.seq_length,
+        'micro_batch_size': data_config.base_batch_size,
         'forward_only': False,
     }
     
@@ -154,15 +149,15 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     
     # Initialize PyTorch profiler if requested
     prof = None
-    if enable_profiling and use_pytorch_profiler:
+    if runtime_config.enable_profiling and runtime_config.use_pytorch_profiler:
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
-                wait=max(profile_start_step - 1, 0) if profile_start_step else 0,
-                warmup=1 if profile_start_step and profile_start_step > 0 else 0,
-                active=(profile_end_step - profile_start_step) if profile_start_step and profile_end_step else num_iterations,
+                wait=max(runtime_config.profile_start_step - 1, 0) if runtime_config.profile_start_step else 0,
+                warmup=1 if runtime_config.profile_start_step and runtime_config.profile_start_step > 0 else 0,
+                active=(runtime_config.profile_end_step - runtime_config.profile_start_step) if runtime_config.profile_start_step and runtime_config.profile_end_step else runtime_config.num_iterations,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(tensorboard_dir) if tensorboard_dir else None,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(runtime_config.tensorboard_dir) if runtime_config.tensorboard_dir else None,
             record_shapes=True,
             with_stack=True,
         )
@@ -170,13 +165,16 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     
     all_losses = []
     
-    for iteration in range(num_iterations):
+    for iteration in range(runtime_config.num_iterations):
+        # Start iteration timing
+        perf_monitor.start_iteration()
+        
         # Handle profiling
-        if enable_profiling:
-            if use_pytorch_profiler:
+        if runtime_config.enable_profiling:
+            if runtime_config.use_pytorch_profiler:
                 if prof:
                     prof.step()
-            elif profile_start_step is not None and iteration == profile_start_step:
+            elif runtime_config.profile_start_step is not None and iteration == runtime_config.profile_start_step:
                 logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
                 torch.cuda.cudart().cudaProfilerStart()
         
@@ -188,15 +186,23 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
             pg_collection=pg_collection, 
             **common_args
         )
+
         
         all_losses.append(losses_reduced)
-        logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Losses: {losses_reduced}")
+        
+        # End iteration timing
+        perf_monitor.end_iteration()
+
+        # Log performance metrics
+        perf_monitor.log_performance(
+            iteration=iteration + 1,
+        )
         
         zero_grad_buffer_for_multimodule(module_to_grid_tuple)
         
         # Stop CUDA profiling if enabled
-        if enable_profiling and not use_pytorch_profiler:
-            if profile_end_step is not None and iteration == profile_end_step:
+        if runtime_config.enable_profiling and not runtime_config.use_pytorch_profiler:
+            if runtime_config.profile_end_step is not None and iteration == runtime_config.profile_end_step:
                 logging.info(f"Rank {dist.get_rank()}: Stopping profiler at iteration {iteration}")
                 torch.cuda.cudart().cudaProfilerStop()
     
@@ -204,7 +210,27 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     if prof:
         prof.stop()
     
-    logging.info(f"Rank {dist.get_rank()}: Training completed. All losses: {all_losses}")
+
+    
+    metrics_dir = runtime_config.metrics_output_dir
+    os.makedirs(metrics_dir, exist_ok=True)
+    
+    vision_arch = model_config.get_arch('images')
+    llm_arch = model_config.get_arch(model_config.llm_module_name)
+    
+    metrics_file = os.path.join(
+        metrics_dir, 
+        f"metrics_vl{vision_arch.num_layers}_ll{llm_arch.num_layers}_mb{data_config.num_microbatches}.json"
+    )
+    perf_monitor.save_metrics_to_file(
+        filepath=metrics_file,
+        extra_info={
+            'exp_name': 'vlm_mimo_model_custom_pgs',
+        },
+        exclude_warmup=True
+    )
+    
+    logging.info(f"Rank {dist.get_rank()}: Training completed.")
     
     return all_losses
 
@@ -213,58 +239,70 @@ if __name__ == "__main__":
     # Initialize distributed training
     Utils.initialize_distributed()
 
-    # Profiling configuration
-    enable_profiling = True
-    use_pytorch_profiler = False  # Set to True for PyTorch profiler, False for CUDA profiler
-    tensorboard_dir = "./tb_logs"  # TensorBoard output directory (only for PyTorch profiler)
-    num_iterations = 6
-    profile_start_step = 3
-    profile_end_step = 5
-    
-    # Model parameters
-    vision_num_layers = 16
-    vision_hidden_size = 1024
-    language_num_layers = 16
-    language_hidden_size = 2048
-
-    # Data parameters
-    vocab_size = 48000
-    image_seq_length = 1024
-    seq_length = 4096  # Total sequence length (text tokens = seq_length - image_seq_length)
-    special_token_ids = {"images": 32000}
-
-    # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
-    vision_tp, vision_pp, vision_dp = 2, 2, 1
-    language_tp, language_pp, language_dp = 2, 2, 1
-    
-    # Training parameters
-    batch_size = 2
-    num_microbatches = 16
- 
-    losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
-        vision_num_layers=vision_num_layers,
-        vision_hidden_size=vision_hidden_size,
-        language_num_layers=language_num_layers,
-        language_hidden_size=language_hidden_size,
-        vocab_size=vocab_size,
-        image_seq_length=image_seq_length,
-        seq_length=seq_length,
-        special_token_ids=special_token_ids,
-        vision_tp=vision_tp,
-        vision_pp=vision_pp,
-        vision_dp=vision_dp,
-        language_tp=language_tp,
-        language_pp=language_pp,
-        language_dp=language_dp,
-        batch_size=batch_size,
-        num_microbatches=num_microbatches,
-        num_iterations=num_iterations,
-        profile_start_step=profile_start_step,
-        profile_end_step=profile_end_step,
-        enable_profiling=enable_profiling,
-        use_pytorch_profiler=use_pytorch_profiler,
-        tensorboard_dir=tensorboard_dir,
+    # Create centralized configurations
+    model_config = ModelConfig(
+        module_architectures={
+            'images': ModuleArchConfig(
+                num_layers=4,
+                hidden_size=768,
+                num_attention_heads=4,
+                seq_length=256,
+                vocab_size=0,  # Vision encoder has no vocab
+            ),
+            'language_module': ModuleArchConfig(
+                num_layers=4,
+                hidden_size=768,
+                num_attention_heads=4,
+                seq_length=1024,
+                vocab_size=4000,
+            ),
+        },
+        module_parallelisms={
+            'images': ModuleParallelismConfig(
+                tensor_parallel=1,
+                pipeline_parallel=1,
+                data_parallel=1,
+            ),
+            'language_module': ModuleParallelismConfig(
+                tensor_parallel=1,
+                pipeline_parallel=1,
+                data_parallel=1,
+            ),
+        },
+        special_token_ids={'images': 32000},
+        llm_module_name='language_module',
     )
-    logging.info(f"Final losses: {losses}")
+    
+    data_config = DataConfig(
+        base_batch_size=8,
+        num_microbatches=16,
+        seq_length=2048,
+        image_seq_length=1024,
+        vocab_size=4000,
+        image_special_token_id=32000,
+        dataset_size=4096,
+        num_workers=8,
+        prefetch_factor=4,
+    )
+    
+    runtime_config = RuntimeConfig(
+        num_iterations=6,
+        warmup_iterations=2,
+        log_interval=1,
+        enable_performance_monitoring=True,
+        metrics_output_dir=os.environ.get("METRICS_OUTPUT_DIR", "./metrics"),
+        enable_profiling=False,
+        use_pytorch_profiler=os.environ.get("USE_PYTORCH_PROFILER", "True").lower() == "true",
+        profile_start_step=3,
+        profile_end_step=5,
+        tensorboard_dir=os.environ.get("PROFILE_OUTPUT_DIR", "./tb_logs"),
+    )
+    
+    # Run training
+    losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
+        model_config=model_config,
+        data_config=data_config,
+        runtime_config=runtime_config,
+    )
 
     dist.destroy_process_group()
