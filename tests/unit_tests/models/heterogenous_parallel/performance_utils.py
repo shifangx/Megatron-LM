@@ -258,6 +258,9 @@ class PerformanceMonitor:
         iter_stats = self._get_minmax_across_ranks('iteration-time')
         fb_stats = self._get_minmax_across_ranks('forward-backward')
         
+        # Collect memory usage from all ranks
+        memory_stats = self._get_memory_stats_all_ranks()
+        
         # Use max time as the bottleneck
         iter_time_sec = iter_stats['max'] / 1000.0 if iter_stats else 0
         
@@ -286,6 +289,8 @@ class PerformanceMonitor:
             'samples_per_sec': samples_per_sec,
             'tokens_per_sec': tokens_per_sec,
             'tflops_per_gpu': tflops_per_gpu,
+            'memory_allocated_per_rank_gb': memory_stats['per_rank'],
+            'memory_allocated_max_gb': memory_stats['max'],
         })
     
     def _get_minmax_across_ranks(self, timer_name: str) -> Optional[Dict[str, float]]:
@@ -313,6 +318,33 @@ class PerformanceMonitor:
         min_ms, max_ms = result[timer_name]
         return {'min': min_ms, 'max': max_ms}
     
+    def _get_memory_stats_all_ranks(self) -> Dict[str, Any]:
+        """Get memory usage statistics from all ranks.
+        
+        Returns:
+            Dict with 'per_rank' (list of memory per rank) and 'max' (max across ranks)
+        """
+        if not torch.cuda.is_available():
+            return {'per_rank': [], 'max': 0.0}
+        
+        # Get memory allocated on this rank (in GB)
+        local_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        
+        if not dist.is_initialized():
+            return {'per_rank': [local_memory_gb], 'max': local_memory_gb}
+        
+        # Gather memory from all ranks
+        memory_tensor = torch.tensor([local_memory_gb], dtype=torch.float32, device='cuda')
+        gathered_memory = [torch.zeros_like(memory_tensor) for _ in range(self.world_size)]
+        
+        dist.all_gather(gathered_memory, memory_tensor)
+        
+        # Convert to list of floats
+        per_rank_memory = [float(m.item()) for m in gathered_memory]
+        max_memory = max(per_rank_memory)
+        
+        return {'per_rank': per_rank_memory, 'max': max_memory}
+    
     def log_performance(self, iteration: int):
         """Log performance metrics for current iteration.
         
@@ -334,7 +366,8 @@ class PerformanceMonitor:
             f"F/B: {metrics['forward_backward_time_min_ms']:.1f}-{metrics['forward_backward_time_max_ms']:.1f} ms | "
             f"TFLOPs/GPU: {metrics['tflops_per_gpu']:.1f} | "
             f"Samples/s: {metrics['samples_per_sec']:.1f} | "
-            f"Tokens/s: {metrics['tokens_per_sec']:.0f}"
+            f"Tokens/s: {metrics['tokens_per_sec']:.0f} | "
+            f"Mem: {metrics['memory_allocated_max_gb']:.2f} GB"
         )
     
     def save_metrics_to_file(
@@ -371,6 +404,7 @@ class PerformanceMonitor:
         samples_per_sec = np.array([h['samples_per_sec'] for h in filtered])
         tokens_per_sec = np.array([h['tokens_per_sec'] for h in filtered])
         tflops_per_gpu = np.array([h['tflops_per_gpu'] for h in filtered])
+        memory_max_gb = np.array([h['memory_allocated_max_gb'] for h in filtered])
         
         # Get architecture info
         vision_arch = self.model_config.get_arch(self.model_config.encoder_module_name)
@@ -388,6 +422,7 @@ class PerformanceMonitor:
         median_fb_max_ms = float(np.median(fb_time_maxs))
         median_tokens_per_sec = float(np.median(tokens_per_sec))
         median_tflops_per_gpu = float(np.median(tflops_per_gpu))
+        max_memory_allocated_gb = float(np.max(memory_max_gb))
         
         # Build row data matching Excel columns
         row_data = {
@@ -406,7 +441,7 @@ class PerformanceMonitor:
             'vision_seq_length': self.data_config.image_seq_length,
             'total_seq_length': self.data_config.seq_length,
             'llm_microbatch_size': self.data_config.base_batch_size,
-            'global_batch_size': self.global_batch_size,
+            'global_batch_size': self.effective_global_batch,
             # Vision model parallelism
             'vision_tp': vision_parallel.tensor_parallel,
             'vision_pp': vision_parallel.pipeline_parallel,
@@ -421,7 +456,11 @@ class PerformanceMonitor:
             'fwd_bwd_min_time_ms': round(median_fb_min_ms, 2),
             'fwd_bwd_max_time_ms': round(median_fb_max_ms, 2),
             'iteration_time_sec': round(median_iter_time_sec, 3),
+            'max_memory_allocated_gb': round(max_memory_allocated_gb, 2),
         }
+        
+        # Collect per-rank memory data for JSON
+        per_rank_memory_all_iters = [h['memory_allocated_per_rank_gb'] for h in filtered]
         
         # Save full metrics to JSON
         metrics = {
@@ -431,6 +470,15 @@ class PerformanceMonitor:
                 'warmup_iterations': self.runtime_config.warmup_iterations,
                 'total_iterations': len(history),
                 'analyzed_iterations': len(filtered),
+            },
+            'memory_per_rank_gb': {
+                'per_iteration': per_rank_memory_all_iters,
+                'summary': {
+                    'max_across_all_ranks_and_iters': max_memory_allocated_gb,
+                    'per_rank_max': [float(np.max([per_rank_memory_all_iters[i][rank] 
+                                                    for i in range(len(per_rank_memory_all_iters))]))
+                                     for rank in range(len(per_rank_memory_all_iters[0]))] if per_rank_memory_all_iters and per_rank_memory_all_iters[0] else [],
+                }
             },
         }
         
@@ -458,6 +506,8 @@ class PerformanceMonitor:
         logging.info(f"  Throughput:")
         logging.info(f"    - {median_tflops_per_gpu:.2f} TFLOPs/s/GPU")
         logging.info(f"    - {median_tokens_per_sec:.0f} tokens/s")
+        logging.info(f"  Memory:")
+        logging.info(f"    - Max allocated: {max_memory_allocated_gb:.2f} GB")
         logging.info("=" * 80)
         logging.info(f"Metrics saved to: {filepath}")
         logging.info(f"CSV saved to: {csv_path}")
