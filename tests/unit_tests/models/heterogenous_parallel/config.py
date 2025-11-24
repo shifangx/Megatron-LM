@@ -40,6 +40,7 @@ class ModelConfig:
     special_token_ids: Dict[str, int] = field(default_factory=dict)
     llm_module_name: str = "language_module"
     encoder_module_name: str = "images"  # Primary encoder module name
+    llm_rank_offset: int = 0  # Rank offset for LLM grid (0 = colocated with vision, >0 = separate GPUs)
     
     def __post_init__(self):
         if self.llm_module_name not in self.module_architectures:
@@ -96,6 +97,9 @@ class RuntimeConfig:
     enable_performance_monitoring: bool = True
     metrics_output_dir: str = "./metrics"
     
+    # Pipeline schedule: "no_pipelining" or "1f1b"
+    pipeline_schedule: str = "1f1b"
+    
     # Profiling
     enable_profiling: bool = False
     use_pytorch_profiler: bool = False
@@ -106,4 +110,9 @@ class RuntimeConfig:
     def __post_init__(self):
         if self.num_iterations < 1:
             raise ValueError("num_iterations must be >= 1")
+        
+        if self.pipeline_schedule not in ["no_pipelining", "1f1b"]:
+            raise ValueError(
+                f"pipeline_schedule must be 'no_pipelining' or '1f1b', got '{self.pipeline_schedule}'"
+            )
 

@@ -47,13 +47,27 @@ def deep_merge(base: Dict, override: Dict) -> Dict:
     return result
 
 
-def load_baseline_config() -> Dict[str, Any]:
-    """Load baseline configuration.
+def load_baseline_config(config_path: str) -> Dict[str, Any]:
+    """Load baseline configuration from the config's parent directory.
     
+    Args:
+        config_path: Path to the experiment config file
+        
     Returns:
         Baseline configuration dictionary
+        
+    Raises:
+        FileNotFoundError: If baseline.yaml doesn't exist in parent directory
     """
-    baseline_path = Path(__file__).parent / "configs" / "baseline.yaml"
+    config_path = Path(config_path)
+    baseline_path = config_path.parent / "baseline.yaml"
+    
+    if not baseline_path.exists():
+        raise FileNotFoundError(
+            f"baseline.yaml not found in {config_path.parent}. "
+            f"Each experiment directory must have a baseline.yaml file."
+        )
+    
     return load_yaml_config(str(baseline_path))
 
 
@@ -90,6 +104,7 @@ def parse_model_config(config_dict: Dict[str, Any]) -> ModelConfig:
         special_token_ids=config_dict['special_token_ids'],
         llm_module_name=config_dict['llm_module_name'],
         encoder_module_name=config_dict['encoder_module_name'],
+        llm_rank_offset=config_dict.get('llm_rank_offset', 0),  # Default to 0 (colocated)
     )
 
 
@@ -134,6 +149,7 @@ def parse_runtime_config(config_dict: Dict[str, Any], experiment_dir: str = None
         log_interval=config_dict['log_interval'],
         enable_performance_monitoring=config_dict['enable_performance_monitoring'],
         metrics_output_dir=metrics_dir,
+        pipeline_schedule=config_dict.get('pipeline_schedule', '1f1b'),
         enable_profiling=config_dict['enable_profiling'],
         use_pytorch_profiler=config_dict['use_pytorch_profiler'],
         profile_start_step=config_dict['profile_start_step'],
@@ -145,6 +161,8 @@ def parse_runtime_config(config_dict: Dict[str, Any], experiment_dir: str = None
 def load_experiment_config(config_path: str, experiment_dir: str = None) -> tuple:
     """Load experiment configuration with baseline merging.
     
+    The baseline.yaml must exist in the same directory as the config file.
+    
     Args:
         config_path: Path to YAML config file (overrides baseline values)
         experiment_dir: Optional experiment directory for outputs
@@ -152,8 +170,8 @@ def load_experiment_config(config_path: str, experiment_dir: str = None) -> tupl
     Returns:
         Tuple of (ModelConfig, DataConfig, RuntimeConfig)
     """
-    # Always start with baseline
-    baseline = load_baseline_config()
+    # Load baseline from config's parent directory
+    baseline = load_baseline_config(config_path)
     
     # Load override config and merge
     override = load_yaml_config(config_path)

@@ -90,7 +90,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         seq_len=data_config.seq_length,
     )
     
-    # CRITICAL FIX: Disable barrier_with_L1_time for multimodule/heterogeneous setups
+
     mimo_model.config.barrier_with_L1_time = False
     
     logging.info(f"Rank {dist.get_rank()}: Model created successfully")
@@ -178,8 +178,6 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
                 logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
                 torch.cuda.cudart().cudaProfilerStart()
         
-        logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Starting 1F1B schedule...")
-        
         # Run 1F1B schedule
         losses_reduced = schedule.forward_backward_pipelining_without_interleaving(
             p2p_communicator=multimodule_communicator, 
@@ -233,6 +231,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     logging.info(f"Rank {dist.get_rank()}: Training completed.")
     
     return all_losses
+
 
 
 if __name__ == "__main__":

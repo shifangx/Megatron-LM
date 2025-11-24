@@ -260,11 +260,13 @@ class MimoModel(MegatronModule):
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         """Set input tensor for pipeline parallelism.
         """
+        if input_tensor[0] is None:
+            return
         current_rank = dist.get_rank()
 
         assert isinstance(input_tensor, list), "Input tensor must be a list"
         assert len(input_tensor) == 1, "Input tensor must be a list of length 1"
-        assert isinstance(input_tensor[0], dict), "Input tensor[0] must be a dictionary"
+        assert isinstance(input_tensor[0], dict), f"Input tensor[0] must be a dictionary"
         
         input_dict = input_tensor[0]
             
