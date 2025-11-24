@@ -13,6 +13,7 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from tests.unit_tests.pipeline_parallel.test_multimodule_schedules import create_hypercomm_grid, _get_pg_collection_with_embedding_groups
 from tests.unit_tests.models.heterogenous_parallel.config import ModelConfig
+from typing import Optional
 
 def get_language_model_spec(num_layers, hidden_size, num_attention_heads, vocab_size, seq_len, pg_collection):
     """Get the language model spec."""
@@ -123,10 +124,13 @@ def get_vlm_mimo_model(
     vision_parallel = model_config.get_parallelism(model_config.encoder_module_name)
     llm_parallel = model_config.get_parallelism(model_config.llm_module_name)
     
-    # Calculate offsets for grids to avoid overlap (CP and EP are hardcoded to 1)
-    vision_grid_size = vision_parallel.tensor_parallel * vision_parallel.pipeline_parallel * vision_parallel.data_parallel
+    # Use llm_rank_offset from config for explicit colocation control
+    # offset=0: Both modules share same GPUs (colocated)
+    # offset>0: Modules use different GPUs starting at different ranks
+    llm_offset = model_config.llm_rank_offset
+    
     language_module_grid = create_hypercomm_grid(
-        offset=vision_grid_size, 
+        offset=llm_offset, 
         tp=llm_parallel.tensor_parallel, 
         cp=1, 
         pp=llm_parallel.pipeline_parallel, 
@@ -135,7 +139,7 @@ def get_vlm_mimo_model(
     language_pg_collection = _get_pg_collection_with_embedding_groups(language_module_grid)
 
     vision_module_grid = create_hypercomm_grid(
-        offset=0, 
+        offset=0,  # Vision always starts at rank 0
         tp=vision_parallel.tensor_parallel, 
         cp=1, 
         pp=vision_parallel.pipeline_parallel, 
@@ -198,3 +202,108 @@ def get_vlm_mimo_model(
     mimo_model.modality_submodules[model_config.encoder_module_name] = submodule
 
     return mimo_model, module_to_grid_map, topology
+
+
+def get_vlm_mimo_model_homogeneous(
+    model_config: ModelConfig,
+    seq_len: int,
+):
+    """Create VLM MIMO model for homogeneous parallelism (Case 1).
+    
+    This function is optimized for homogeneous parallelism where:
+    - Both vision and LLM use the same parallelism strategy
+    - Both modules share the same grid and process groups
+    - Only one grid and pg_collection are created
+    
+    Args:
+        model_config: Model configuration (architectures, parallelisms, special tokens)
+        seq_len: Sequence length for the language model
+        
+    Returns:
+        Tuple of (mimo_model, shared_grid, shared_pg_collection, topology)
+    """
+    # Validate homogeneous parallelism
+    vision_parallel = model_config.get_parallelism(model_config.encoder_module_name)
+    llm_parallel = model_config.get_parallelism(model_config.llm_module_name)
+    
+    if (vision_parallel.tensor_parallel != llm_parallel.tensor_parallel or
+        vision_parallel.pipeline_parallel != llm_parallel.pipeline_parallel or
+        vision_parallel.data_parallel != llm_parallel.data_parallel):
+        raise ValueError(
+            f"Homogeneous parallelism requires identical TP/PP/DP for all modules. "
+            f"Vision: TP={vision_parallel.tensor_parallel}, PP={vision_parallel.pipeline_parallel}, DP={vision_parallel.data_parallel}. "
+            f"LLM: TP={llm_parallel.tensor_parallel}, PP={llm_parallel.pipeline_parallel}, DP={llm_parallel.data_parallel}."
+        )
+    
+    # Extract configurations
+    vision_arch = model_config.get_arch(model_config.encoder_module_name)
+    llm_arch = model_config.get_arch(model_config.llm_module_name)
+    
+    # Create single shared grid for both modules
+    shared_grid = create_hypercomm_grid(
+        offset=0,
+        tp=llm_parallel.tensor_parallel,
+        cp=1,
+        pp=llm_parallel.pipeline_parallel,
+        dp=llm_parallel.data_parallel
+    )
+    shared_pg_collection = _get_pg_collection_with_embedding_groups(shared_grid)
+    
+    # Create model specs using shared pg_collection
+    language_model_spec = get_language_model_spec(
+        llm_arch.num_layers,
+        llm_arch.hidden_size,
+        llm_arch.num_attention_heads,
+        llm_arch.vocab_size,
+        seq_len,
+        shared_pg_collection
+    )
+    vision_submodule_spec = get_vision_submodules_spec(
+        vision_arch.num_layers,
+        vision_arch.hidden_size,
+        vision_arch.num_attention_heads,
+        llm_arch.hidden_size,
+        shared_pg_collection
+    )
+    
+    mimo_config = MimoModelConfig(
+        language_model_spec=language_model_spec,
+        modality_submodules_spec={model_config.encoder_module_name: vision_submodule_spec},
+        special_token_ids=model_config.special_token_ids,
+    )
+    
+    # Create MIMO model
+    mimo_model = MimoModel(mimo_config)
+    
+    # Topology (same as heterogeneous case)
+    topology = {
+        model_config.encoder_module_name: [model_config.llm_module_name],  # encoder sends to LLM
+        model_config.llm_module_name: [],  # LLM is the last stage
+    }
+    
+    # Move to device
+    mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
+    
+    # Wrap both modules with DDP using shared pg_collection
+    ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+    
+    if mimo_model.language_model is not None:
+        mimo_model.language_model = DistributedDataParallel(
+            config=mimo_model.language_model.config,
+            ddp_config=ddp_config,
+            module=mimo_model.language_model,
+            pg_collection=shared_pg_collection
+        )
+    
+    submodule = mimo_model.modality_submodules[model_config.encoder_module_name]
+    if submodule is not None:
+        submodule = DistributedDataParallel(
+            config=submodule.encoders['clip_encoder'].config,
+            ddp_config=ddp_config,
+            module=submodule,
+            pg_collection=shared_pg_collection
+        )
+    mimo_model.modality_submodules[model_config.encoder_module_name] = submodule
+    
+    return mimo_model, shared_grid, shared_pg_collection, topology
+

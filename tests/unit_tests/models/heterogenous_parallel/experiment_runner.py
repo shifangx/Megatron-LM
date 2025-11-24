@@ -17,6 +17,7 @@ from typing import List, Dict, Any
 
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.models.heterogenous_parallel.train import test_1f_1b_schedule_vlm_mimo_model_custom_pgs
+from tests.unit_tests.models.heterogenous_parallel.train_homogeneous import train_homogeneous_parallelism
 from tests.unit_tests.models.heterogenous_parallel.config_loader import (
     load_experiment_config,
     generate_experiment_name
@@ -91,6 +92,7 @@ class ExperimentRunner:
         # Generate descriptive name
         descriptive_name = generate_experiment_name(model_config, data_config)
         
+        
         # Save config copy to experiment directory
         if rank == 0:
             import shutil
@@ -101,18 +103,30 @@ class ExperimentRunner:
                 "experiment_name": exp_name,
                 "descriptive_name": descriptive_name,
                 "config_file": str(config_path),
+                "pipeline_schedule": runtime_config.pipeline_schedule,
                 "timestamp": datetime.now().isoformat(),
             }
             with open(exp_dir / "experiment_info.json", 'w') as f:
                 json.dump(config_info, f, indent=2)
+            
+            logging.info(f"Using training function with schedule: {runtime_config.pipeline_schedule}")
         
-        # Run training
+        # Run training with appropriate function
         try:
-            losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
-                model_config=model_config,
-                data_config=data_config,
-                runtime_config=runtime_config,
-            )
+            if runtime_config.pipeline_schedule == "no_pipelining":
+                # Use no-pipelining schedule for homogeneous parallelism
+                losses = train_homogeneous_parallelism(
+                    model_config=model_config,
+                    data_config=data_config,
+                    runtime_config=runtime_config,
+                )
+            else:
+                # Use 1F1B schedule for heterogeneous/pipeline parallelism
+                losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
+                    model_config=model_config,
+                    data_config=data_config,
+                    runtime_config=runtime_config,
+                )
             
             if rank == 0:
                 logging.info(f"Rank {rank}: Experiment {exp_name} completed successfully")
