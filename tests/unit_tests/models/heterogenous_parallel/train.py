@@ -9,7 +9,7 @@ from functools import partial
 import logging
 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.models.heterogenous_parallel.model_specs import get_vlm_mimo_model
@@ -251,7 +251,7 @@ if __name__ == "__main__":
             'language_module': ModuleArchConfig(
                 num_layers=4,
                 hidden_size=768,
-                num_attention_heads=4,
+                num_attention_heads=8,
                 seq_length=1024,
                 vocab_size=4000,
             ),
@@ -260,16 +260,17 @@ if __name__ == "__main__":
             'images': ModuleParallelismConfig(
                 tensor_parallel=1,
                 pipeline_parallel=1,
-                data_parallel=1,
+                data_parallel=2,
             ),
             'language_module': ModuleParallelismConfig(
-                tensor_parallel=1,
+                tensor_parallel=2,
                 pipeline_parallel=1,
                 data_parallel=1,
             ),
         },
         special_token_ids={'images': 32000},
         llm_module_name='language_module',
+        llm_rank_offset=0,
     )
     
     data_config = DataConfig(
