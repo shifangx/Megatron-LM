@@ -157,7 +157,6 @@ def train_homogeneous_parallelism(
     
     all_losses = []
     
-    logging.info(f"Rank {dist.get_rank()}: Starting training with forward_backward_no_pipelining schedule")
     
     for iteration in range(runtime_config.num_iterations):
         # Start iteration timing
@@ -171,8 +170,6 @@ def train_homogeneous_parallelism(
             elif runtime_config.profile_start_step is not None and iteration == runtime_config.profile_start_step:
                 logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
                 torch.cuda.cudart().cudaProfilerStart()
-        
-        logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Starting no-pipelining schedule...")
         
         # Run forward_backward_no_pipelining schedule
         # Note: This schedule doesn't use P2P communicator since there's no pipeline parallelism
@@ -244,30 +241,30 @@ if __name__ == "__main__":
     model_config = ModelConfig(
         module_architectures={
             'images': ModuleArchConfig(
-                num_layers=2,
+                num_layers=40,
                 hidden_size=1408,
                 num_attention_heads=16,
                 seq_length=1024,
                 vocab_size=0,  # Vision encoder has no vocab
             ),
             'language_module': ModuleArchConfig(
-                num_layers=4,
-                hidden_size=4096,
-                num_attention_heads=32,
+                num_layers=80,
+                hidden_size=8192,
+                num_attention_heads=64,
                 seq_length=4096,
                 vocab_size=32000,
             ),
         },
         module_parallelisms={
             'images': ModuleParallelismConfig(
-                tensor_parallel=2,
+                tensor_parallel=8,
                 pipeline_parallel=1,
-                data_parallel=4,
+                data_parallel=1,
             ),
             'language_module': ModuleParallelismConfig(
-                tensor_parallel=2,
+                tensor_parallel=8,
                 pipeline_parallel=1,
-                data_parallel=4,
+                data_parallel=1,
             ),
         },
         special_token_ids={'images': 32000},
@@ -275,7 +272,7 @@ if __name__ == "__main__":
     )
     
     data_config = DataConfig(
-        base_batch_size=2,
+        base_batch_size=1,
         num_microbatches=16,
         seq_length=4096,
         image_seq_length=1024,
