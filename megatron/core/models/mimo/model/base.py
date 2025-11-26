@@ -278,6 +278,10 @@ class MimoModel(MegatronModule):
         for modality_name, submodule in self.modality_submodules.items():
             if modality_name in input_dict:
                 tensor = input_dict[modality_name]
+
+                if tensor is None:
+                    continue
+
                 if isinstance(tensor, list):
                     tensor = tensor[0]
                 
@@ -295,6 +299,9 @@ class MimoModel(MegatronModule):
             lm_tensor = input_dict['language_module']
             if isinstance(lm_tensor, list):
                 lm_tensor = lm_tensor[0]
+
+            if lm_tensor is None:
+                return
             
             self.language_model_input_tensor = lm_tensor
             logger.debug(
