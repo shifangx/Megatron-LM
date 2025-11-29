@@ -2,13 +2,14 @@
 
 import logging
 import warnings
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 import dataclasses
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.models.mimo.config import MimoModelConfig
+from megatron.core.pipeline_parallel.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
@@ -91,6 +92,46 @@ class MimoModel(MegatronModule):
         # These will be set by set_input_tensor() and used in forward()
         self.modality_input_tensors = {}
         self.language_model_input_tensor = None
+        
+        # Build colocated communicators if configured
+        # Used when encoder and LLM are on same ranks with different TP/DP
+        self.colocated_comms: Dict[Tuple[str, str], ColocatedBridgeCommunicator] = {}
+        if mimo_config.colocated_comm_config is not None:
+            self._build_colocated_communicators()
+    
+    def _build_colocated_communicators(self) -> None:
+        """Build ColocatedBridgeCommunicator for each edge in the topology.
+        
+        Creates one communicator per (src_module, dest_module) pair defined
+        in the colocated_comm_config topology.
+        """
+        cfg = self.mimo_config.colocated_comm_config
+        
+        for src_name, dest_list in cfg.topology.items():
+            for dest_name in dest_list:
+                if src_name not in cfg.module_to_grid_map:
+                    raise ValueError(
+                        f"Source module '{src_name}' in topology not found in module_to_grid_map. "
+                        f"Available modules: {list(cfg.module_to_grid_map.keys())}"
+                    )
+                if dest_name not in cfg.module_to_grid_map:
+                    raise ValueError(
+                        f"Destination module '{dest_name}' in topology not found in module_to_grid_map. "
+                        f"Available modules: {list(cfg.module_to_grid_map.keys())}"
+                    )
+                
+                self.colocated_comms[(src_name, dest_name)] = ColocatedBridgeCommunicator(
+                    src_grid=cfg.module_to_grid_map[src_name],
+                    dest_grid=cfg.module_to_grid_map[dest_name],
+                    src_module_name=src_name,
+                    dest_module_name=dest_name,
+                    dim_mapping=cfg.dim_mapping,
+                )
+                
+                logger.info(
+                    f"[Rank {dist.get_rank()}] Built colocated communicator: "
+                    f"{src_name} -> {dest_name}"
+                )
     
     def align_embeddings_by_token_positions(
         self,
@@ -444,6 +485,27 @@ class MimoModel(MegatronModule):
                         f"[Rank {current_rank}][MimoModel][forward][{modality_name}] "
                         f"Intermediate PP stage but no input tensor stored from set_input_tensor"
                     )
+
+        # Apply colocated communication if configured
+        # This transforms embeddings from encoder's TP/DP to destination module's TP/DP
+        if self.colocated_comms:
+            for modality_name in list(modality_embeddings.keys()):
+                for (src_name, dest_name), comm in self.colocated_comms.items():
+                    if src_name == modality_name:
+                        embeddings = modality_embeddings[modality_name]
+                        logger.debug(
+                            f"[Rank {current_rank}][MimoModel][forward][{modality_name}] "
+                            f"Applying colocated communication to {dest_name}, "
+                            f"input shape: {embeddings.shape}"
+                        )
+                        
+                        communicated = comm.communicate(embeddings)
+                        modality_embeddings[modality_name] = communicated
+                        
+                        logger.debug(
+                            f"[Rank {current_rank}][MimoModel][forward][{modality_name}] "
+                            f"After colocated communication, output shape: {communicated.shape}"
+                        )
 
         # Only process if language model is available on this rank
         if self.language_model is None:
