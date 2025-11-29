@@ -271,6 +271,104 @@ def get_data_iterator(
     return iter(dataloader)
 
 
+def get_data_iterator_colocated(
+    model_config: ModelConfig,
+    data_config: DataConfig,
+    module_to_grid_map: Dict[str, Any],
+) -> Optional[Iterator]:
+    """Create DP-aware data iterator for colocated heterogeneous training.
+    
+    For colocated case, we load with the DP that has FEWER replicas (larger batch):
+    - Fan-in (encoder_dp > llm_dp): load with LLM DP
+    - Fan-out (encoder_dp < llm_dp): load with encoder DP
+    
+    The forward_step function will slice the data appropriately for each module.
+    
+    Args:
+        model_config: Model configuration with parallelism settings
+        data_config: Data configuration (batch sizes, dataset params)
+        module_to_grid_map: Maps module names to their HyperCommGrids
+        
+    Returns:
+        Data iterator for this rank
+    """
+    # Validate batch configuration
+    global_batch_size = validate_heterogeneous_batch_config(
+        model_config=model_config,
+        data_config=data_config,
+    )
+    
+    # Get both grids
+    encoder_grid = module_to_grid_map.get(model_config.encoder_module_name)
+    llm_grid = module_to_grid_map.get(model_config.llm_module_name)
+    
+    if encoder_grid is None:
+        raise ValueError(f"Encoder grid '{model_config.encoder_module_name}' not found")
+    if llm_grid is None:
+        raise ValueError(f"LLM grid '{model_config.llm_module_name}' not found")
+    
+    encoder_dp = encoder_grid.get_pg("dp").size()
+    llm_dp = llm_grid.get_pg("dp").size()
+    
+    # Load with the DP that has fewer replicas (larger batch per rank)
+    if encoder_dp > llm_dp:
+        # Fan-in: LLM has fewer DP replicas, larger batch
+        use_grid = llm_grid
+        load_mode = "LLM DP (fan-in)"
+    else:
+        # Fan-out or equal: Encoder has fewer/equal DP replicas
+        use_grid = encoder_grid
+        load_mode = "Encoder DP (fan-out/equal)"
+    
+    dp_size = use_grid.get_pg("dp").size()
+    dp_rank = use_grid.get_pg("dp").rank()
+    
+    current_rank = dist.get_rank()
+    logging.info(
+        f"[Rank {current_rank}] Colocated data iterator: using {load_mode} "
+        f"(dp_rank={dp_rank}, dp_size={dp_size})"
+    )
+    
+    # Create dataset
+    dataset = MockVLMDataset(
+        size=data_config.dataset_size,
+        image_size=224,
+        seq_len=data_config.seq_length,
+        image_seq_length=data_config.image_seq_length,
+        pad_token_id=0,
+        image_token_id=data_config.image_special_token_id
+    )
+    
+    # Create DP-aware batch sampler
+    batch_sampler = HeterogeneousDPBatchSampler(
+        dataset_size=len(dataset),
+        global_batch_size=global_batch_size,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        drop_last=True
+    )
+    
+    # Get vision hidden size from model config
+    vision_hidden_size = model_config.get_arch(model_config.encoder_module_name).hidden_size
+    
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=data_config.num_workers,
+        collate_fn=lambda batch: _collate_fn(
+            batch,
+            image_seq_length=data_config.image_seq_length,
+            hidden_size=vision_hidden_size
+        ),
+        pin_memory=data_config.pin_memory,
+        persistent_workers=data_config.persistent_workers,
+        prefetch_factor=data_config.prefetch_factor,
+    )
+    
+    return iter(dataloader)
+
+
 def get_batch(data_iterator: Optional[Iterator]) -> Optional[Dict[str, Any]]:
     """Get next batch from data iterator and move to GPU.
     
