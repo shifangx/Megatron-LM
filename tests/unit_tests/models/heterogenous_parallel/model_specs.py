@@ -2,7 +2,7 @@ import torch.distributed as dist
 import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+from megatron.core.models.mimo.config.base_configs import ColocatedCommConfig, MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -306,4 +306,133 @@ def get_vlm_mimo_model_homogeneous(
     mimo_model.modality_submodules[model_config.encoder_module_name] = submodule
     
     return mimo_model, shared_grid, shared_pg_collection, topology
+
+
+def get_vlm_mimo_model_colocated(
+    model_config: ModelConfig,
+    seq_len: int,
+):
+    """Create VLM MIMO model for colocated heterogeneous parallelism.
+    
+    This function is for colocated case where:
+    - Encoder and LLM run on the SAME GPUs (PP=1 for both)
+    - They can have DIFFERENT TP/DP configurations
+    - Uses ColocatedBridgeCommunicator for data redistribution
+    
+    Args:
+        model_config: Model configuration (architectures, parallelisms, special tokens)
+        seq_len: Sequence length for the language model
+        
+    Returns:
+        Tuple of (mimo_model, module_to_grid_map, topology)
+    """
+    # Validate colocated requirements
+    vision_parallel = model_config.get_parallelism(model_config.encoder_module_name)
+    llm_parallel = model_config.get_parallelism(model_config.llm_module_name)
+    
+    if vision_parallel.pipeline_parallel != 1 or llm_parallel.pipeline_parallel != 1:
+        raise ValueError(
+            f"Colocated parallelism requires PP=1 for all modules. "
+            f"Vision PP={vision_parallel.pipeline_parallel}, LLM PP={llm_parallel.pipeline_parallel}."
+        )
+    
+    if vision_parallel.total_ranks != llm_parallel.total_ranks:
+        raise ValueError(
+            f"Colocated parallelism requires same total ranks for all modules. "
+            f"Vision: {vision_parallel.total_ranks}, LLM: {llm_parallel.total_ranks}."
+        )
+    
+    # Extract configurations
+    vision_arch = model_config.get_arch(model_config.encoder_module_name)
+    llm_arch = model_config.get_arch(model_config.llm_module_name)
+    
+    # Create grids - both start at offset 0 (colocated)
+    vision_module_grid = create_hypercomm_grid(
+        offset=0,
+        tp=vision_parallel.tensor_parallel,
+        cp=1,
+        pp=1,
+        dp=vision_parallel.data_parallel
+    )
+    vision_pg_collection = _get_pg_collection_with_embedding_groups(vision_module_grid)
+    
+    language_module_grid = create_hypercomm_grid(
+        offset=0,  # Same offset = colocated
+        tp=llm_parallel.tensor_parallel,
+        cp=1,
+        pp=1,
+        dp=llm_parallel.data_parallel
+    )
+    language_pg_collection = _get_pg_collection_with_embedding_groups(language_module_grid)
+    
+    # Create model specs
+    language_model_spec = get_language_model_spec(
+        llm_arch.num_layers,
+        llm_arch.hidden_size,
+        llm_arch.num_attention_heads,
+        llm_arch.vocab_size,
+        seq_len,
+        language_pg_collection
+    )
+    vision_submodule_spec = get_vision_submodules_spec(
+        vision_arch.num_layers,
+        vision_arch.hidden_size,
+        vision_arch.num_attention_heads,
+        llm_arch.hidden_size,
+        vision_pg_collection
+    )
+    
+    # Build module_to_grid_map and topology
+    module_to_grid_map = {
+        model_config.encoder_module_name: vision_module_grid,
+        model_config.llm_module_name: language_module_grid
+    }
+    topology = {
+        model_config.encoder_module_name: [model_config.llm_module_name],
+        model_config.llm_module_name: [],
+    }
+    
+    # Create colocated communication config
+    colocated_comm_config = ColocatedCommConfig(
+        module_to_grid_map=module_to_grid_map,
+        topology=topology,
+        dim_mapping={'b': 0, 's': 1, 'h': 2},
+    )
+    
+    # Create MIMO config with colocated communication
+    mimo_config = MimoModelConfig(
+        language_model_spec=language_model_spec,
+        modality_submodules_spec={model_config.encoder_module_name: vision_submodule_spec},
+        special_token_ids=model_config.special_token_ids,
+        colocated_comm_config=colocated_comm_config,
+    )
+    
+    # Create MIMO model
+    mimo_model = MimoModel(mimo_config)
+    
+    # Move to device
+    mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
+    
+    # Wrap modules with DDP using their respective pg_collections
+    ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+    
+    if mimo_model.language_model is not None:
+        mimo_model.language_model = DistributedDataParallel(
+            config=mimo_model.language_model.config,
+            ddp_config=ddp_config,
+            module=mimo_model.language_model,
+            pg_collection=language_pg_collection
+        )
+    
+    submodule = mimo_model.modality_submodules[model_config.encoder_module_name]
+    if submodule is not None:
+        submodule = DistributedDataParallel(
+            config=submodule.encoders['clip_encoder'].config,
+            ddp_config=ddp_config,
+            module=submodule,
+            pg_collection=vision_pg_collection
+        )
+    mimo_model.modality_submodules[model_config.encoder_module_name] = submodule
+    
+    return mimo_model, module_to_grid_map, topology
 
