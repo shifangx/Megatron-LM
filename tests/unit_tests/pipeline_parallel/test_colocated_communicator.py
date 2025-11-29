@@ -388,7 +388,9 @@ class TestColocatedCommunicatorGolden:
         "src_tp, src_dp, dest_tp, dest_dp",
         [
             (4, 2, 2, 4),  # Fan-out: DP2 → DP4
+            (8, 1, 1, 8),  # Fan-out: DP1 → DP8
             (2, 4, 4, 2),  # Fan-in: DP4 → DP2
+            (8, 1, 8, 1),  # Fan-in: DP8 → DP1
             (4, 2, 4, 2),  # Equal DP
         ],
     )
