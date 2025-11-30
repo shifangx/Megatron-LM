@@ -2130,6 +2130,9 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    # TODO(shifang): vision mode forward
+    print(f"for debug, TODO: call vision model forward before forward_step and then send to language model.")
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
