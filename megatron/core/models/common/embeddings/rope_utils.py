@@ -119,8 +119,8 @@ def _apply_rotary_pos_emb_bshd(
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
-    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+    cos_ = (torch.cos(freqs) * mscale).to(dtype=t.dtype, device=t.device)
+    sin_ = (torch.sin(freqs) * mscale).to(dtype=t.dtype, device=t.device)
 
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
