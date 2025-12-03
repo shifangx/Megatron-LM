@@ -380,6 +380,11 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
+    execute_mode = {
+        "execute_get_batch": False,
+        "execute_vision_model_forward": False,
+        "execute_language_model_forward": True,
+    }
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
@@ -402,10 +407,10 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, loss_func = forward_step_func(data_iterator, model, execute_mode=execute_mode)
         else:
             output_tensor, loss_func = forward_step_func(
-                data_iterator, model, checkpoint_activations_microbatch
+                data_iterator, model, checkpoint_activations_microbatch, execute_mode=execute_mode
             )
     output_tensor, num_tokens = forward_step_calc_loss(
         model,
@@ -1991,6 +1996,39 @@ def forward_backward_pipelining_without_interleaving(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
 
+    # TODO(shfiangx): get batch, and modality bridge related code here.
+    set_current_microbatch = get_attr_wrapped_model(model, "set_current_microbatch")
+    set_vision_embeds = get_attr_wrapped_model(model, "set_vision_embeds")
+    set_deepstack_feature_lists = get_attr_wrapped_model(model, "set_deepstack_feature_lists")
+    rank = torch.distributed.get_rank()
+    global_batches = []
+    vision_model_outputs = []
+    # get batch for the whole global batch
+    # todo: data balance
+    for i in range(num_microbatches):
+        execute_mode = {
+            "execute_get_batch": True,
+            "execute_vision_model_forward": False,
+            "execute_language_model_forward": False,
+        }
+        with torch.no_grad():
+            batch = forward_step_func(data_iterator, model, execute_mode=execute_mode)
+        global_batches.append(batch)
+
+    # vision model forward for the whole global batch
+    # todo: modality bridge
+    for i in range(num_microbatches):
+        execute_mode = {
+            "execute_get_batch": False,
+            "execute_vision_model_forward": True,
+            "execute_language_model_forward": False,
+        }
+        batch = global_batches[i]
+        set_current_microbatch(batch)
+        with torch.no_grad():
+            output_tensor, loss_function = forward_step_func(data_iterator, model, execute_mode=execute_mode)
+        vision_model_outputs.append(output_tensor)
+
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
@@ -2132,6 +2170,13 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+        if p2p_communicator.pp_group.rank() == 0:
+            print(f"for debug, rank {torch.distributed.get_rank()}, set vision_embeds and deepstack_feature_lists, current_microbatch:{i}")    
+            vision_embeds, deepstack_feature_lists = vision_model_outputs[i]
+            set_vision_embeds(vision_embeds)
+            set_deepstack_feature_lists(deepstack_feature_lists)
+            batch = global_batches[i]
+            set_current_microbatch(batch)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -2177,8 +2222,15 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
-        last_iteration = i == (num_microbatches_remaining - 1)
+        if p2p_communicator.pp_group.rank() == 0:
+            print(f"for debug, rank {torch.distributed.get_rank()}, set vision_embeds and deepstack_feature_lists, current_microbatch:{i + num_warmup_microbatches}")    
+            vision_embeds, deepstack_feature_lists = vision_model_outputs[i + num_warmup_microbatches]
+            set_vision_embeds(vision_embeds)
+            set_deepstack_feature_lists(deepstack_feature_lists)
+            batch = global_batches[i + num_warmup_microbatches]
+            set_current_microbatch(batch)
 
+        last_iteration = i == (num_microbatches_remaining - 1)
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -2284,6 +2336,17 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+    
+    # TODO(shifang): vision model backward
+    # for i in range(num_microbatches):
+    #     execute_mode = {
+    #         "execute_get_batch": False,
+    #         "execute_vision_model_forward": True,
+    #         "execute_language_model_forward": False,
+    #     }
+    #     batch = global_batches[i]
+    #     set_current_microbatch(batch)
+    #     todo_vision_model_backward(batch)
 
     if config.finalize_model_grads_func is not None and not forward_only:
 
