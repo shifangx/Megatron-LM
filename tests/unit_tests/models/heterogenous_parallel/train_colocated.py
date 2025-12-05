@@ -286,6 +286,20 @@ def train_colocated_mimo(
     
     logging.info(f"Rank {dist.get_rank()}: Colocated training completed.")
     
+    # Cleanup: destroy process groups to free GPU memory for next experiment
+    for grid in module_to_grid_map.values():
+        if hasattr(grid, '_pgs'):
+            for pg in grid._pgs.values():
+                if pg is not None:
+                    try:
+                        dist.destroy_process_group(pg)
+                    except:
+                        pass
+            grid._pgs.clear()
+    
+    # Delete model to free GPU memory
+    del mimo_model
+    
     return all_losses
 
 
@@ -350,7 +364,7 @@ if __name__ == "__main__":
         log_interval=1,
         enable_performance_monitoring=True,
         metrics_output_dir=os.environ.get("METRICS_OUTPUT_DIR", "./logs/metrics"),
-        pipeline_schedule="no_pipelining",
+        pipeline_schedule="colocated",
         enable_profiling=False,
     )
     

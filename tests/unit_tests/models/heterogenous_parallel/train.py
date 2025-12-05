@@ -230,6 +230,20 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     
     logging.info(f"Rank {dist.get_rank()}: Training completed.")
     
+    # Cleanup: destroy process groups to free GPU memory for next experiment
+    for grid in module_to_grid_map.values():
+        if hasattr(grid, '_pgs'):
+            for pg in grid._pgs.values():
+                if pg is not None:
+                    try:
+                        dist.destroy_process_group(pg)
+                    except:
+                        pass
+            grid._pgs.clear()
+    
+    # Delete model to free GPU memory
+    del mimo_model
+    
     return all_losses
 
 

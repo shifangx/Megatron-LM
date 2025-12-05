@@ -230,6 +230,19 @@ def train_homogeneous_parallelism(
     
     logging.info(f"Rank {dist.get_rank()}: Training completed.")
     
+    # Cleanup: destroy process groups to free GPU memory for next experiment
+    if hasattr(shared_grid, '_pgs'):
+        for pg in shared_grid._pgs.values():
+            if pg is not None:
+                try:
+                    dist.destroy_process_group(pg)
+                except:
+                    pass
+        shared_grid._pgs.clear()
+    
+    # Delete model to free GPU memory
+    del mimo_model
+    
     return all_losses
 
 
