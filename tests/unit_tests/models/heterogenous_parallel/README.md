@@ -1,5 +1,3 @@
-# Ablation Experiments for Colocated Heterogeneous Parallelism
-
 ## Running Experiments
 
 ```bash
