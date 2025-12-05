@@ -1,0 +1,25 @@
+# Set A.2.3: Colocated V_TP2/DP4 + L_TP8/DP1, Vision seq 6144
+# Vision compute: ~25%, Expected gain: 22-30%
+# HIGH PRIORITY EXPERIMENT
+# image_seq_length: 6144, images_tp: 2, images_dp: 4, language_tp: 8, language_dp: 1
+
+model:
+  module_architectures:
+    images:
+      seq_length: 6144
+  
+  module_parallelisms:
+    images:
+      tensor_parallel: 2
+      data_parallel: 4
+    language_module:
+      tensor_parallel: 8
+      data_parallel: 1
+
+data:
+  image_seq_length: 6144
+  num_microbatches: 8
+
+runtime:
+  pipeline_schedule: "colocated"
+

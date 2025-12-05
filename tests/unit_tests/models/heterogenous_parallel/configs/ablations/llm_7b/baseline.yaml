@@ -1,0 +1,60 @@
+# Baseline for Set A - 1B Vision + 7B LLM sequence length experiments
+# All experiments in this folder inherit from this baseline
+
+model:
+  module_architectures:
+    images:
+      num_layers: 40
+      hidden_size: 1408
+      num_attention_heads: 16
+      seq_length: 1024  # Will be overridden per experiment
+      vocab_size: 0
+    
+    language_module:
+      num_layers: 32
+      hidden_size: 4096
+      num_attention_heads: 32
+      seq_length: 8192
+      vocab_size: 32000
+  
+  module_parallelisms:
+    images:
+      tensor_parallel: 4
+      pipeline_parallel: 1
+      data_parallel: 2
+    
+    language_module:
+      tensor_parallel: 4
+      pipeline_parallel: 1
+      data_parallel: 2
+  
+  special_token_ids:
+    images: 32000
+  
+  llm_module_name: "language_module"
+  encoder_module_name: "images"
+  llm_rank_offset: 0
+
+data:
+  base_batch_size: 4
+  num_microbatches: 8
+  seq_length: 8192
+  image_seq_length: 1024  # Will be overridden per experiment
+  vocab_size: 32000
+  image_special_token_id: 32000
+  dataset_size: 2048
+  num_workers: 4
+  prefetch_factor: 2
+
+runtime:
+  num_iterations: 10
+  warmup_iterations: 2
+  log_interval: 1
+  enable_performance_monitoring: true
+  pipeline_schedule: "homogeneous"  # Will be overridden for colocated
+  enable_profiling: false
+  use_pytorch_profiler: false
+  profile_start_step: 3
+  profile_end_step: 8
+  metrics_output_dir: "./logs/ablations/set_a/llm_7b"
+  tensorboard_dir: "./logs/ablations/set_a/llm_7b/tb"

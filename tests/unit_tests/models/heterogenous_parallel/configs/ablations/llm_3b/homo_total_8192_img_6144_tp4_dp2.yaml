@@ -1,0 +1,30 @@
+# Set A.2.3: Homogeneous TP4/DP2, Vision seq 6144
+# Vision compute: ~25%, Expected colocated gain: 22-30%
+# HIGH PRIORITY EXPERIMENT
+# same tp, dp for both vision and language
+# image_seq_length: 6144, tp: 4, dp: 2
+
+model:
+  module_architectures:
+    images:
+      seq_length: 6144
+  
+  module_parallelisms:
+    images:
+      tensor_parallel: 4
+      pipeline_parallel: 1
+      data_parallel: 2
+    
+    language_module:
+      tensor_parallel: 4
+      pipeline_parallel: 1
+      data_parallel: 2
+      
+
+data:
+  image_seq_length: 6144
+  num_microbatches: 4
+
+runtime:
+  pipeline_schedule: "homogeneous"
+
