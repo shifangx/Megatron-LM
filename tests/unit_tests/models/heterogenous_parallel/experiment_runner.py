@@ -1,12 +1,21 @@
 """
 Runs multiple experiments based on YAML configs.
 
-uv run python -m torch.distributed.run --nproc_per_node=2 tests/unit_tests/models/heterogenous_parallel/experiment_runner.py --config tests/unit_tests/models/heterogenous_parallel/configs/baseline.yaml
+# Run all experiments in a directory
+uv run python -m torch.distributed.run --nproc_per_node=8 \
+    tests/unit_tests/models/heterogenous_parallel/experiment_runner.py \
+    --experiments-dir tests/unit_tests/models/heterogenous_parallel/configs/ablations/set_a_seq_length/llm_3b/
+
+# Run a single experiment
+uv run python -m torch.distributed.run --nproc_per_node=8 \
+    tests/unit_tests/models/heterogenous_parallel/experiment_runner.py \
+    --config tests/unit_tests/models/heterogenous_parallel/configs/ablations/set_a_seq_length/llm_3b/coloc_seq4096.yaml
 
 """
 
 import os
 import sys
+import gc
 import logging
 import json
 import torch
@@ -18,10 +27,19 @@ from typing import List, Dict, Any
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.models.heterogenous_parallel.train import test_1f_1b_schedule_vlm_mimo_model_custom_pgs
 from tests.unit_tests.models.heterogenous_parallel.train_homogeneous import train_homogeneous_parallelism
+from tests.unit_tests.models.heterogenous_parallel.train_colocated import train_colocated_mimo
 from tests.unit_tests.models.heterogenous_parallel.config_loader import (
     load_experiment_config,
     generate_experiment_name
 )
+
+
+def cleanup_between_experiments():
+    """Simple cleanup to free GPU memory between experiments."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -54,10 +72,14 @@ class ExperimentRunner:
     def find_config_files(self) -> List[Path]:
         """Find all YAML config files in experiments directory.
         
+        Skips baseline.yaml as it's used for config inheritance, not as an experiment.
+        
         Returns:
             List of paths to config files
         """
         config_files = list(self.experiments_dir.glob("*.yaml")) + list(self.experiments_dir.glob("*.yml"))
+        # Skip baseline.yaml - it's for inheritance, not an experiment
+        config_files = [f for f in config_files if f.name != "baseline.yaml"]
         config_files = sorted(config_files)
         logging.info(f"Found {len(config_files)} config files: {[f.name for f in config_files]}")
         return config_files
@@ -70,8 +92,6 @@ class ExperimentRunner:
             experiment_idx: Index of this experiment (0-based)
             total_experiments: Total number of experiments
         """
-        # Utils.initialize_distributed()
-
         rank = dist.get_rank() if dist.is_initialized() else 0
         
         logging.info(f"\n{'='*80}")
@@ -111,27 +131,36 @@ class ExperimentRunner:
             
             logging.info(f"Using training function with schedule: {runtime_config.pipeline_schedule}")
         
-        # Run training with appropriate function
+        # Run training with appropriate function based on pipeline_schedule
         try:
-            if runtime_config.pipeline_schedule == "no_pipelining":
+            if runtime_config.pipeline_schedule == "homogeneous":
                 # Use no-pipelining schedule for homogeneous parallelism
-                losses = train_homogeneous_parallelism(
+                _ = train_homogeneous_parallelism(
+                    model_config=model_config,
+                    data_config=data_config,
+                    runtime_config=runtime_config,
+                )
+            elif runtime_config.pipeline_schedule == "colocated":
+                # Use colocated schedule for heterogeneous TP/DP on same GPUs
+                _ = train_colocated_mimo(
+                    model_config=model_config,
+                    data_config=data_config,
+                    runtime_config=runtime_config,
+                )
+            elif runtime_config.pipeline_schedule == "1f1b":
+                # Use 1F1B schedule for heterogeneous/pipeline parallelism
+                _ = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
                     model_config=model_config,
                     data_config=data_config,
                     runtime_config=runtime_config,
                 )
             else:
-                # Use 1F1B schedule for heterogeneous/pipeline parallelism
-                losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
-                    model_config=model_config,
-                    data_config=data_config,
-                    runtime_config=runtime_config,
-                )
+                raise ValueError(f"Invalid pipeline schedule: {runtime_config.pipeline_schedule}"
+                f"Valid schedules are: homogeneous, colocated, 1f1b")
             
             if rank == 0:
                 logging.info(f"Rank {rank}: Experiment {exp_name} completed successfully")
                 logging.info(f"Rank {rank}: Results saved to: {exp_dir}")
-            # dist.destroy_process_group()
                 
         except Exception as e:
             logging.error(f"Rank {rank}: Experiment {exp_name} failed with error: {e}")
@@ -144,8 +173,11 @@ class ExperimentRunner:
                 }
                 with open(exp_dir / "error.json", 'w') as f:
                     json.dump(error_info, f, indent=2)
-            # dist.destroy_process_group()
+            cleanup_between_experiments()
             raise
+        
+        # Clean up GPU memory between experiments
+        cleanup_between_experiments()
     
     def aggregate_results(self):
         """Aggregate all experiment CSVs into one combined CSV."""
@@ -157,7 +189,7 @@ class ExperimentRunner:
         import csv
         
         # Find all CSV files in experiment subdirectories
-        csv_files = list(self.run_dir.glob("*/metrics_*.csv"))
+        csv_files = list(self.run_dir.glob("*/*.csv"))
         
         if not csv_files:
             logging.warning("No CSV files found to aggregate")

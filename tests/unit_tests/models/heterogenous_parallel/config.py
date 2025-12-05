@@ -97,7 +97,10 @@ class RuntimeConfig:
     enable_performance_monitoring: bool = True
     metrics_output_dir: str = "./metrics"
     
-    # Pipeline schedule: "no_pipelining" or "1f1b"
+    # Pipeline schedule: "homogeneous", "colocated", or "1f1b"
+    # - homogeneous: same TP/DP for all modules, no pipeline parallelism
+    # - colocated: heterogeneous TP/DP on same GPUs (PP=1 for all)
+    # - 1f1b: heterogeneous with pipeline parallelism (modules on different GPUs)
     pipeline_schedule: str = "1f1b"
     
     # Profiling
@@ -111,8 +114,8 @@ class RuntimeConfig:
         if self.num_iterations < 1:
             raise ValueError("num_iterations must be >= 1")
         
-        if self.pipeline_schedule not in ["no_pipelining", "1f1b"]:
+        if self.pipeline_schedule not in ["homogeneous", "colocated", "1f1b"]:
             raise ValueError(
-                f"pipeline_schedule must be 'no_pipelining' or '1f1b', got '{self.pipeline_schedule}'"
+                f"pipeline_schedule must be 'homogeneous', 'colocated', or '1f1b', got '{self.pipeline_schedule}'"
             )
 
