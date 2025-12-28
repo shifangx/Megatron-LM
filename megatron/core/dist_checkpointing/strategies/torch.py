@@ -4,6 +4,7 @@
 import io
 import os
 import pickle
+import platform
 import warnings
 from collections import ChainMap, defaultdict
 from contextlib import contextmanager
@@ -96,8 +97,15 @@ def register_default_torch_strategies():
     register_default_strategy(
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
     )
+    # for Grace-Blackwell (ARM64) we need to use only 1 thread for saving checkpoint
+    if platform.machine() in ('aarch64', 'arm64'):
+        torch_dist_save_thread_count: int = 1
+    else:
+        torch_dist_save_thread_count: int = 2
     register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=1)  # ARM64 fix: disable multiprocessing
+        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy(
+            'torch_dist', 1, thread_count=torch_dist_save_thread_count
+        )
     )
 
 
@@ -699,7 +707,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 1,
+        thread_count: int = 2,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):
