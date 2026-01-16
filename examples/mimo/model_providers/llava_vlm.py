@@ -24,7 +24,7 @@ from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer.spec_utils import ModuleSpec
-
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 def model_provider_llava_vlm(
     pre_process: bool = True,
@@ -32,7 +32,9 @@ def model_provider_llava_vlm(
     add_encoder=True,
     add_decoder=True,
     image_special_token_id: int = 32000,
-    is_video_input: bool = False
+    is_video_input: bool = False,
+    config=None,
+    pg_collection: ProcessGroupCollection = None,
 ):
     """
     Build a LLaVA-style Vision-Language MIMO model composed of:
@@ -114,7 +116,7 @@ def model_provider_llava_vlm(
     )
 
     # Create MIMO model
-    mimo_model = MimoModel(mimo_model_config)
+    mimo_model = MimoModel(mimo_model_config, pg_collection=pg_collection)
     print("*"*100)
     print_mimo_structure(mimo_model)
     print("*"*100)

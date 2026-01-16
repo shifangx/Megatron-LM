@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=2
+GPUS_PER_NODE=4
 NUM_NODES=1
 DEBUG_MODE=false     # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678      # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -31,8 +31,8 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=8
-gbs=128
+mbs=1
+gbs=8
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
@@ -52,35 +52,33 @@ DISTRIBUTED_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 1
-	--pipeline-model-parallel-size 1
+	--pipeline-model-parallel-size 4
 )
 
 TRAINING_ARGS=(
     --micro-batch-size $mbs
     --global-batch-size $gbs 
-    --train-iters 2200
+    --train-iters 20
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --lr 0.001
     --lr-decay-style cosine 
     --min-lr 2.0e-5
-    --lr-warmup-iters 150
-    --lr-decay-iters 2200 
+    --lr-warmup-iters 10
+    --lr-decay-iters 20
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
     --model-provider llava_vlm
+    --memory-snapshot-path ./logs/memory_snapshots
 )
 
 EVAL_AND_LOGGING_ARGS=(
-    --log-interval 10
+    --log-interval 1
     --save-interval 2000 
     --eval-interval 20000 
     --save $CHECKPOINT_STORE_PATH 
-    --eval-iters 30
+    --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --wandb-project $WANDB_PROJECT
-    --wandb-exp-name $EXP_NAME
-    --wandb-save-dir $CHECKPOINT_STORE_PATH
     ${LANGUAGE_MODEL_CKPT_ARG[@]}
 )
 

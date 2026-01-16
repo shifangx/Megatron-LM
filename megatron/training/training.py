@@ -631,6 +631,27 @@ def pretrain(
             it is automatically injected when in-process restart is in use
     """
 
+    print(f"for debug, start to record memory history")
+    torch.cuda.memory._record_memory_history(
+        True,
+        # keep 100,000 alloc/free events from before the snapshot
+        trace_alloc_max_entries=100000,
+        # record stack information for the trace events
+        trace_alloc_record_context=True,
+    )
+
+    # def oom_observer(device, alloc, device_alloc, device_free):
+    #     # snapshot right after an OOM happened
+    #     print('saving allocated state during OOM')
+    #     snapshot = torch.cuda.memory._snapshot()
+    #     from pickle import dump
+    #     rank = torch.distributed.get_rank()
+    #     filename = f'{args.memory_snapshot_path}_oom_iter_{iteration}_rank_{rank}.pkl'
+    #     print(f'for debug, saving memory snapshot during OOM for rank {rank} at iteration {iteration} to {filename}')
+    #     with open(filename, 'wb') as f:
+    #         dump(snapshot, f)
+    # torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
@@ -1782,13 +1803,22 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
         )
-    if iteration % args.log_interval == 0:
-        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+    if iteration == 5:
+        rank = torch.distributed.get_rank()
+        snapshot = torch.cuda.memory._snapshot()
+        from pickle import dump
+        filename = f'{args.memory_snapshot_path}_iter_{iteration}_rank_{rank}.pkl'
+        print(f'for debug, saving memory snapshot for rank {rank} at iteration {iteration} to {filename}')
+        with open(filename, 'wb') as f:
+            dump(snapshot, f)
+    if iteration % args.log_interval == 0:
+        # if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
+        #     snapshot = torch.cuda.memory._snapshot()
+        #     from pickle import dump
+
+        #     with open(args.memory_snapshot_path, 'wb') as f:
+        #         dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations

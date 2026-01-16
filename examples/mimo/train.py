@@ -33,6 +33,7 @@ from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -96,8 +97,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         getattr(args, 'context_parallel_size', 1) == 1
     ), "Context parallelism is not supported yet in MIMO implementation"
 
-    assert (getattr(args, 'pipeline_model_parallel_size', 1) == 1), \
-        "Pipeline parallelism is not supported yet in MIMO implementation"
+    # assert (getattr(args, 'pipeline_model_parallel_size', 1) == 1), \
+    #     "Pipeline parallelism is not supported yet in MIMO implementation"
     
     # Broadcast data - only get data on tensor parallel rank 0
     # data iterator is None on other tp ranks
@@ -199,6 +200,8 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    config=None,
+    pg_collection: ProcessGroupCollection = None,
 ):
     """Model provider for MIMO model training.
 
@@ -237,6 +240,8 @@ def model_provider(
         post_process,
         add_encoder,
         add_decoder,
+        config=config,
+        pg_collection=pg_collection,
         **kwargs,
     )
 
