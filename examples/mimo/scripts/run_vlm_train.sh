@@ -52,7 +52,7 @@ DISTRIBUTED_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 1
-	--pipeline-model-parallel-size 4
+	--pipeline-model-parallel-size 1
 )
 
 TRAINING_ARGS=(
@@ -74,9 +74,7 @@ TRAINING_ARGS=(
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval 2000 
     --eval-interval 20000 
-    --save $CHECKPOINT_STORE_PATH 
     --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     ${LANGUAGE_MODEL_CKPT_ARG[@]}
