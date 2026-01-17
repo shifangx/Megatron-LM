@@ -7,7 +7,7 @@ This script provides a basic training loop for MIMO models.
 import os
 import sys
 from functools import partial
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 import torch
 
@@ -34,6 +34,13 @@ from utils.data_helpers import broadcast_nested_data_batch
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
+)
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -81,7 +88,7 @@ def add_mimo_args(parser):
     return parser
 
 
-def get_batch(data_iterator: Iterator[Dict[str, Any]]):
+def get_batch(data_iterator: Iterator[Dict[str, Any]], vp_stage: Optional[int] = None):
     """Generate a batch for MIMO model training.
 
     Args:
@@ -91,7 +98,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         tuple: Batch data for model training
     """
     args = get_args()
-
+    if not is_first_or_last_pipeline_stage(vp_stage):
+            return None
     # Assert that context parallelism and pipeline parallelism are not supported yet
     assert (
         getattr(args, 'context_parallel_size', 1) == 1
@@ -170,6 +178,10 @@ def forward_step(data_iterator, model):
         tuple: (output_tensor, loss_function)
     """
     data_batch = get_batch(data_iterator)
+    
+    data_batch = get_batch(data_iterator)
+    if data_batch is None:
+        data_batch = {'input_ids': None}
     output_tensor, loss_mask = model(**data_batch)
     # Return output and loss function
     return output_tensor, partial(loss_func, loss_mask)

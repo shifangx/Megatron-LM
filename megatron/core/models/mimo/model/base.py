@@ -263,22 +263,23 @@ class MimoModel(MegatronModule):
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
+        if input_ids is not None:
+            # Get text embeddings
+            text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+            logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
-        # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
-        logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
+            modality_embeddings["text"] = text_embeddings
 
-        modality_embeddings["text"] = text_embeddings
-
-        # 2. Merge embeddings from different modalities
-        logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
-        combined_embeddings = self.align_embeddings_by_token_positions(
-            modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
-            input_ids=input_ids,  # Pass in batch-first format [b, s]
-            special_token_ids=self.special_token_ids,
-        )  # [s, b, h]
-        logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
-
+            # 2. Merge embeddings from different modalities
+            logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
+            combined_embeddings = self.align_embeddings_by_token_positions(
+                modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
+                input_ids=input_ids,  # Pass in batch-first format [b, s]
+                special_token_ids=self.special_token_ids,
+            )  # [s, b, h]
+            logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
+        else:
+            combined_embeddings = None
         # 3. Forward pass through language model
         lm_output = self.language_model(
             input_ids=None,

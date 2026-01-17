@@ -295,7 +295,7 @@ class P2PCommunicator:
         """
 
         config = self.config
-        config.pipeline_dtype = torch.bfloat16
+        config.pipeline_dtype = torch.float32
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
