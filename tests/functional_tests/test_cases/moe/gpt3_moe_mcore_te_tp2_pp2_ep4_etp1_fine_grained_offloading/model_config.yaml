@@ -5,6 +5,9 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
+  NVTE_FUSED_ATTN: 0
+  NCCL_ALGO: ^NVLS
+  CUBLAS_WORKSPACE_CONFIG: ':4096:8'
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -23,20 +26,18 @@ MODEL_ARGS:
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 4
-  --global-batch-size: 32
+  --micro-batch-size: 1
+  --global-batch-size: 8
   --train-iters: 50
   --exit-duration-in-mins: 230
   --no-check-for-nan-in-loss-and-grad: true
   --no-rope-fusion: true
-  --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: native
   --manual-gc: true
   --manual-gc-interval: 100
   --recompute-granularity: selective
   --recompute-modules: "[layernorm mla_up_proj mlp moe_act]"
   --fine-grained-activation-offloading: true
-  --offload-modules: "[expert_fc1 moe_act attn_norm mlp_norm]"
+  --offload-modules: "[expert_fc1 moe_act attn_norm mlp_norm qkv_linear core_attn attn_proj]"
   # Transformer Engine args
   --transformer-impl: transformer_engine
   # Data args
