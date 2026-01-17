@@ -29,21 +29,25 @@ def _batched_p2p_ops(
             torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
         )
         ops.append(send_prev_op)
+        print(f"for debug, rank={torch.distributed.get_rank()}, in _batched_p2p_ops, after tensor_send_prev, ops: {ops}")
     if tensor_recv_prev is not None:
         recv_prev_op = torch.distributed.P2POp(
             torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
         )
         ops.append(recv_prev_op)
+        print(f"for debug, rank={torch.distributed.get_rank()}, in _batched_p2p_ops, after tensor_recv_prev, ops: {ops}")
     if tensor_send_next is not None:
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
         )
         ops.append(send_next_op)
+        print(f"for debug, rank={torch.distributed.get_rank()}, in _batched_p2p_ops, after tensor_send_next, ops: {ops}")
     if tensor_recv_next is not None:
         recv_next_op = torch.distributed.P2POp(
             torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
         )
         ops.append(recv_next_op)
+        print(f"for debug, rank={torch.distributed.get_rank()}, in _batched_p2p_ops, after tensor_recv_next, ops: {ops}")
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
@@ -161,7 +165,16 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
-
+        
+        # for debug
+        print(f"for debug, rank={torch.distributed.get_rank()}, in P2PCommunicator, test pp_group: {self.pp_group}")
+        tensor = torch.tensor([torch.distributed.get_rank()], dtype=torch.int32, device=torch.cuda.current_device())
+        print(f"for debug, rank={torch.distributed.get_rank()}, in P2PCommunicator, tensor before all_reduce: {tensor}")
+        torch.distributed.all_reduce(tensor, group=self.pp_group, op=torch.distributed.ReduceOp.SUM)
+        print(f"for debug, rank={torch.distributed.get_rank()}, in P2PCommunicator, tensor after all_reduce: {tensor}")
+        # assert False
+        # exit(0)
+        
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
         tensor shapes before the actual tensor communication happens.
@@ -180,6 +193,7 @@ class P2PCommunicator:
         Returns:
             (recv_prev_shape, recv_next_shape)
         """
+        assert False
         config = self.config
         recv_prev_shape_tensor = None
         recv_next_shape_tensor = None
@@ -294,8 +308,8 @@ class P2PCommunicator:
 
         """
 
+        print(f"for debug, rank={torch.distributed.get_rank()}, in _communicate, group size={self.pp_group.size()}, group:{self.pp_group}")
         config = self.config
-        config.pipeline_dtype = torch.float32
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 

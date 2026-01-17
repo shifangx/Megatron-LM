@@ -30,7 +30,7 @@ def get_vicuna_language_model_config(
     Llama-7B).
     """
 
-    cfg = TransformerConfig(num_layers=32, hidden_size=4096, num_attention_heads=32)
+    cfg = TransformerConfig(num_layers=32, hidden_size=4096, num_attention_heads=32, pipeline_dtype=torch.float32)
 
     # Feed-forward / MLP hidden size (11008 in original Vicuna).
     cfg.ffn_hidden_size = 11008

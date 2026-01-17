@@ -32,7 +32,7 @@ if [ "$1" = "-d" ]; then
 fi
 
 mbs=1
-gbs=8
+gbs=1
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''

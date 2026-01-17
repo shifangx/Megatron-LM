@@ -1293,6 +1293,13 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    # for debug
+    print(f"for debug, rank={torch.distributed.get_rank()}, in initialize_model_parallel, test _PIPELINE_MODEL_PARALLEL_GROUP: {_PIPELINE_MODEL_PARALLEL_GROUP}")
+    tensor = torch.tensor([torch.distributed.get_rank()], dtype=torch.int32, device=torch.cuda.current_device())
+    print(f"for debug, rank={torch.distributed.get_rank()}, in initialize_model_parallel, tensor before all_reduce: {tensor}")
+    torch.distributed.all_reduce(tensor, group=_PIPELINE_MODEL_PARALLEL_GROUP, op=torch.distributed.ReduceOp.SUM)
+    print(f"for debug, rank={torch.distributed.get_rank()}, in initialize_model_parallel, tensor after all_reduce: {tensor}")
+    # assert False
 
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
