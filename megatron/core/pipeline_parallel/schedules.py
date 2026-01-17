@@ -288,11 +288,19 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # In the multimodule case, output_tensor is a dictionary of tensors, 
+        # we need to get the device from the output_tensor's first value in this case.
+        if type(output_tensor) == dict:
+            for key, value in output_tensor.items():
+                device = value.device
+                break
+        else:
+            device = output_tensor.device
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
