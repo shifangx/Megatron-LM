@@ -9,6 +9,7 @@ import torch
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class MimoModel(MegatronModule):
             Configuration for the model, including language model and modality submodules
     """
 
-    def __init__(self, mimo_config: MimoModelConfig) -> None:
+    def __init__(self, mimo_config: MimoModelConfig, pg_collection: Optional[ProcessGroupCollection] = None) -> None:
         """Initialize the multimodal model.
 
         Example:
@@ -43,6 +44,7 @@ class MimoModel(MegatronModule):
         """
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
+        self.pg_collection = pg_collection
 
         warnings.warn(
             "MimoModel is experimental and still under active development. "

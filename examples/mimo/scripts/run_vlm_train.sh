@@ -31,8 +31,8 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=8
-gbs=128
+mbs=2
+gbs=16
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
@@ -58,7 +58,7 @@ MODEL_PARALLEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $mbs
     --global-batch-size $gbs 
-    --train-iters 2200
+    --train-iters 20
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --lr 0.001
@@ -72,17 +72,17 @@ TRAINING_ARGS=(
 )
 
 EVAL_AND_LOGGING_ARGS=(
-    --log-interval 10
+    --log-interval 1
     --save-interval 2000 
     --eval-interval 20000 
     --save $CHECKPOINT_STORE_PATH 
-    --eval-iters 30
+    --eval-iters 0
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --wandb-project $WANDB_PROJECT
-    --wandb-exp-name $EXP_NAME
-    --wandb-save-dir $CHECKPOINT_STORE_PATH
     ${LANGUAGE_MODEL_CKPT_ARG[@]}
 )
+    # --wandb-project $WANDB_PROJECT
+    # --wandb-exp-name $EXP_NAME
+    # --wandb-save-dir $CHECKPOINT_STORE_PATH
 
 # Tokenizer args
 TOKENIZER_ARGS=(

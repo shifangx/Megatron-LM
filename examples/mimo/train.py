@@ -33,6 +33,8 @@ from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -199,6 +201,8 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    config: TransformerConfig = None,
+    pg_collection: ProcessGroupCollection = None,
 ):
     """Model provider for MIMO model training.
 
@@ -237,6 +241,8 @@ def model_provider(
         post_process,
         add_encoder,
         add_decoder,
+        config=config,
+        pg_collection=pg_collection,
         **kwargs,
     )
 
