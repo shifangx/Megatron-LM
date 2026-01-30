@@ -236,15 +236,17 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
 
     if not hasattr(base_module, "layer_number"):
         return True, True
-
+    pg_collection = get_attr_wrapped_model(
+        base_module, 'pg_collection', allow_none=False
+    )
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
     vp_size = base_module.config.virtual_pipeline_model_parallel_size or 1
     for i in range(vp_size):
         # layer numbers are 1-indexed
-        layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i)
-        num_layers_to_build = get_num_layers_to_build(base_module.config, vp_stage=i)
+        layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i, pp_rank=pg_collection.pp.rank())
+        num_layers_to_build = get_num_layers_to_build(base_module.config, vp_stage=i, pp_rank=pg_collection.pp.rank())
         if num_layers_to_build > 0:
             first_layer_numbers.append(layer_offset + 1)
             last_layer_numbers.append(layer_offset + num_layers_to_build)
