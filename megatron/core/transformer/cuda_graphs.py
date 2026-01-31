@@ -1666,7 +1666,8 @@ class TECudaGraphHelper:
                  seq_length,
                  micro_batch_size,
                  optimizers=[],
-                 pg_collection=None):
+                 pg_collection=None,
+                 num_warmup_microbatches=None):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             config.cuda_graph_impl == "transformer_engine"
@@ -2070,14 +2071,16 @@ class TECudaGraphHelper:
             self.num_microbatches = 1
         else:
             self.num_microbatches = get_num_microbatches()
-
-        _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            self.num_microbatches,
-            self.num_model_chunks,
-            self.config.microbatch_group_size_per_vp_stage,
-            forward_only=False,
-            p2p_communicator=self.p2p_communicator,
-        )
+        if self.num_warmup_microbatches is None:
+            _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
+                self.num_microbatches,
+                self.num_model_chunks,
+                self.config.microbatch_group_size_per_vp_stage,
+                forward_only=False,
+                p2p_communicator=self.p2p_communicator,
+            )
+        else:
+            num_warmup_microbatches = self.num_warmup_microbatches
         schedule_table = get_schedule_table(
             self.num_microbatches,
             self.num_model_chunks,
