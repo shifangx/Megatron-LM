@@ -164,7 +164,6 @@ def deallocate_output_tensor_container(
     deallocate_pipeline_outputs: bool = False,
 ):
     '''Deallocate output tensor, handling both tensor and dict cases.'''
-    return # TODO(shifang), for debug
     if not deallocate_pipeline_outputs:
         return
 
@@ -2118,8 +2117,6 @@ def forward_backward_pipelining_without_interleaving(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
     tp_group, cp_group = None, None
-    print(f"for debug, in forward_backward_pipelining_without_interleaving(), type(p2p_communicator) is {type(p2p_communicator)}, type(pg_collection) is {type(pg_collection)}")
-    assert isinstance(p2p_communicator, MultiModulePipelineCommunicator), "p2p_communicator should be a MultiModulePipelineCommunicator"
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config

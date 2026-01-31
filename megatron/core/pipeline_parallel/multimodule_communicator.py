@@ -302,14 +302,11 @@ class MultiModulePipelineCommunicator:
                     # If last stage, and has outgoing modules, send forward activation
                     # by using bridge communicator.
                     for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                        print(f"for debug, [Rank {dist.get_rank()} ], module_name: {module_name}, bridge_comm.src_module_name: {bridge_comm.src_module_name}, bridge_comm.dest_module_name: {bridge_comm.dest_module_name}")
                         with nvtx.range(f"send_forward_bridge_rank:{self.current_rank}:{bridge_comm.src_module_name}->{bridge_comm.dest_module_name}"):
-                            print(f"for debug, [Rank {dist.get_rank()} ], output_dict[module_name].shape: {output_dict[module_name].shape}")
-                            # logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} tensor shape: {output_dict[module_name].shape} sum {output_dict[module_name].sum()}')
+                            logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} tensor shape: {output_dict[module_name].shape} sum {output_dict[module_name].sum()}')
                             tensor_to_send = _ensure_3d_tensor(output_dict[module_name])
                             bridge_comm.send_forward(tensor_to_send)
-                            # time.sleep(10)
-                            # logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name} DONE')
+                            logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name} DONE')
                 else:
                     # If not last stage, send forward activation by using P2P communicator.
                     with nvtx.range(f"send_forward_p2p_rank:{self.current_rank}:{module_name}"):
