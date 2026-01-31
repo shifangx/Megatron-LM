@@ -2071,7 +2071,9 @@ class TECudaGraphHelper:
             self.num_microbatches = 1
         else:
             self.num_microbatches = get_num_microbatches()
-        if self.num_warmup_microbatches is None:
+        if hasattr(self, 'num_warmup_microbatches') and self.num_warmup_microbatches is not None:
+            num_warmup_microbatches = self.num_warmup_microbatches
+        else:
             _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
                 self.num_microbatches,
                 self.num_model_chunks,
@@ -2079,8 +2081,6 @@ class TECudaGraphHelper:
                 forward_only=False,
                 p2p_communicator=self.p2p_communicator,
             )
-        else:
-            num_warmup_microbatches = self.num_warmup_microbatches
         schedule_table = get_schedule_table(
             self.num_microbatches,
             self.num_model_chunks,
