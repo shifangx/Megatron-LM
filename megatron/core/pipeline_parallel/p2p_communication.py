@@ -643,3 +643,20 @@ class P2PCommunicator:
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv').stop()
         return input_tensor, output_tensor_grad
+
+    @property
+    def is_pp_first_stage(self):
+        curr_rank_in_pg = self.pp_group.rank()
+        return curr_rank_in_pg == 0
+
+    @property
+    def is_pp_last_stage(self):
+        curr_rank_in_pg = self.pp_group.rank()
+        pp_size = self.pp_group.size()
+        return curr_rank_in_pg == pp_size - 1
+
+    @property
+    def num_warmup_microbatches(self):
+        curr_rank_in_pg = self.pp_group.rank()
+        pp_size = self.pp_group.size()
+        return max(0, pp_size - curr_rank_in_pg - 1)
