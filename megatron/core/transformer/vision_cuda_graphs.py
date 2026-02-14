@@ -34,9 +34,10 @@ try:
 except ImportError:
     HAVE_TE_GRAPHS = False
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 try:
     from megatron.core.transformer.cuda_graphs import CudaGraphScope
-    from megatron.core.utils import get_attr_wrapped_model
+    from megatron.core.utils import get_attr_wrapped_model, log_single_rank
     from megatron.core.parallel_state import get_cuda_rng_tracker
 except ImportError:
     CudaGraphScope = None
@@ -110,7 +111,11 @@ class VisionTECudaGraphHelper:
         vision_seq_length: int,
         micro_batch_size: int,
         num_microbatches: int = 1,
+        pg_collection=None,
     ):
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TransformerEngine."
         assert (
             vision_config.cuda_graph_impl == "transformer_engine"
@@ -132,6 +137,14 @@ class VisionTECudaGraphHelper:
         # Get vision encoder layers
         self.vision_layers = []
         self.vision_model = None
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
+        self.tp_group = self.pg_collection.tp
+        self.dp_cp_group = self.pg_collection.dp_cp
+        self.pp_group = self.pg_collection.pp
+        from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+        self.p2p_communicator = P2PCommunicator(pp_group=self.pp_group, config=self.vision_config)
 
         for model_chunk in model:
             # Try to get vision_model from the model chunk
@@ -223,8 +236,7 @@ class VisionTECudaGraphHelper:
         torch.cuda.synchronize()
         start_time = time.time()
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(f"Rank {rank}: Starting vision encoder CUDA graph capture...")
+        log_single_rank(logger, logging.INFO, f'Start Vision Encoder CUDA Graphs capture...')
 
         return start_time
 
@@ -233,12 +245,12 @@ class VisionTECudaGraphHelper:
         torch.cuda.synchronize()
         elapsed = time.time() - start_time
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(
-            f"Rank {rank}: Vision encoder CUDA graph capture completed in {elapsed:.2f}s. "
-            f"Captured {len(self.callables)} layers."
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Time spent in Vision Encoder CUDA Graphs capture on rank {torch.distributed.get_rank()}: '
+            f'{time.time() - start_time}s',
         )
-
         self._graphs_created = True
 
     def create_cudagraphs(self):
@@ -281,7 +293,6 @@ class VisionTECudaGraphHelper:
         # so we compute _order identically to the LM helper (TECudaGraphHelper).
         # This ensures make_graphed_callables can reuse static buffers across
         # microbatches whose lifetimes don't overlap in the actual schedule.
-        from megatron.core import parallel_state
         from megatron.core.pipeline_parallel.schedules import (
             get_pp_rank_microbatches,
             get_schedule_table,
@@ -291,7 +302,7 @@ class VisionTECudaGraphHelper:
         num_model_chunks = 1
 
         # If PP is not enabled, we only need to capture one microbatch.
-        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+        if self.pp_group.size() == 1:
             self.num_microbatches = 1
         # else: keep self.num_microbatches as passed from train.py
 
@@ -299,7 +310,8 @@ class VisionTECudaGraphHelper:
             self.num_microbatches,
             num_model_chunks,
             getattr(self.vision_config, 'microbatch_group_size_per_vp_stage', None),
-            False,
+            forward_only=False,
+            p2p_communicator=self.p2p_communicator,
         )
         schedule_table = get_schedule_table(
             self.num_microbatches,
@@ -311,12 +323,6 @@ class VisionTECudaGraphHelper:
         )
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(
-            f"Rank {rank}: Vision CUDA graph order: "
-            f"num_microbatches={self.num_microbatches}, "
-            f"num_warmup={num_warmup_microbatches}, "
-            f"order_len={len(order)}"
-        )
 
         start_time = self._start_capturing()
 
