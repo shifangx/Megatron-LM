@@ -316,7 +316,7 @@ class BridgeCommunicator:
                         f"send to rank {dest_rank}"
                     )
                     dist.send(tensor_split, dst=dest_rank)
-
+                    print(f"for debug, rank {dist.get_rank()}, in send_forward, after call dist.send. tensor_split.shape: {tensor_split.shape}, dtype: {tensor_split.dtype}")
     def recv_forward(self) -> torch.Tensor:
         """Receive forward activation tensor.
 
@@ -364,6 +364,7 @@ class BridgeCommunicator:
                     f"received tensor from src rank {src_rank} "
                     f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
                 )
+                print(f"for debug, rank {dist.get_rank()}, in recv_forward, after call dist.recv. tensor_to_recv.shape: {tensor_to_recv.shape}")
                 received_tensors_list.append(tensor_to_recv)
             aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
             logging.debug(
@@ -376,11 +377,12 @@ class BridgeCommunicator:
                 aggregated_tensor.shape, device=aggregated_tensor.device, dtype=torch.int64
             )
             dist.broadcast(shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg)
-
+            print(f"for debug, rank {dist.get_rank()}, in recv_forward, after call dist.broadcast. shape_tensor: {shape_tensor}")
             # Step 2: broadcast the actual tensor
             dist.broadcast(
                 aggregated_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
             )
+            print(f"for debug, rank {dist.get_rank()}, in recv_forward, after call dist.broadcast. aggregated_tensor.shape: {aggregated_tensor.shape}, dtype: {aggregated_tensor.dtype}")
 
             return aggregated_tensor
 
@@ -393,7 +395,7 @@ class BridgeCommunicator:
             dist.broadcast(
                 shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
-
+            print(f"for debug, rank {dist.get_rank()}, in recv_forward, after call dist.broadcast. shape_tensor: {shape_tensor}")
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
                 received_shape,
@@ -406,6 +408,7 @@ class BridgeCommunicator:
             dist.broadcast(
                 received_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
+            print(f"for debug, rank {dist.get_rank()}, in recv_forward, after call dist.broadcast. received_tensor.shape: {received_tensor.shape}, dtype: {received_tensor.dtype}")
 
             logging.debug(
                 f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
@@ -628,6 +631,7 @@ class BridgeCommunicator:
                 dist.broadcast(
                     shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
                 )
+                print(f"for debug, rank {dist.get_rank()}, in send_forward_recv_backward, after call dist.broadcast. shape_tensor: {shape_tensor}")
 
                 # Broadcast the tensors to all ranks in the group
                 dist.broadcast(
@@ -645,6 +649,7 @@ class BridgeCommunicator:
             dist.broadcast(
                 shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
+            print(f"for debug, rank {dist.get_rank()}, in send_forward_recv_backward, after call dist.broadcast. shape_tensor: {shape_tensor}")
 
             # Use the received shape to create tensor for broadcast
             received_shape = tuple(shape_tensor.tolist())
