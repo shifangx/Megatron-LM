@@ -494,25 +494,25 @@ class TestMultimoduleSchedules:
     #         num_microbatches=16,
     #     )
 
-    # def test_dual_encoder_tp1_dp2_8gpu(self):
-    #     """Test dual encoder + LLM on 8 GPUs (TP=1, DP=2, PP=2 for each encoder)."""
-    #     if self.world_size != 8:
-    #         pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+    def test_dual_encoder_tp1_dp2_8gpu(self):
+        """Test dual encoder + LLM on 8 GPUs (TP=1, DP=2, PP=2 for each encoder)."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
 
-    #     encoder_configs = [
-    #         {'name': 'encoder_1', 'tp': 1, 'pp': 2, 'dp': 2, 'grid_offset': 0},
-    #         {'name': 'encoder_2', 'tp': 1, 'pp': 2, 'dp': 2, 'grid_offset': 0},
-    #     ]
-    #     llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
+        encoder_configs = [
+            {'name': 'encoder_1', 'tp': 1, 'pp': 2, 'dp': 2, 'grid_offset': 0},
+            {'name': 'encoder_2', 'tp': 1, 'pp': 2, 'dp': 2, 'grid_offset': 0},
+        ]
+        llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
 
-    #     run_multimodule_schedule_test(
-    #         encoder_configs,
-    #         llm_config,
-    #         hidden_size=1024,
-    #         seq_length=512,
-    #         micro_batch_size=4,
-    #         num_microbatches=8,
-    #     )
+        run_multimodule_schedule_test(
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=8,
+        )
 
     def test_dual_encoder_8gpu(self):
         print(f"for debug, rank {dist.get_rank()}, in test_dual_encoder_8gpu")
@@ -534,4 +534,46 @@ class TestMultimoduleSchedules:
             micro_batch_size=4,
             num_microbatches=8,
         )
-        print(f"for debug, rank {dist.get_rank()}, after run_multimodule_schedule_test")
+        print(f"for debug, rank {dist.get_rank()}, after test_dual_encoder_8gpu")
+
+    def test_dual_encoder_tp1_dp2_4gpu(self):
+        """Test dual encoder + LLM on 4 GPUs (TP=1, DP=2, PP=2 for each encoder)."""
+        if self.world_size != 4:
+            pytest.skip(f"Requires 4 GPUs, got {self.world_size}")
+
+        encoder_configs = [
+            {'name': 'encoder_1', 'tp': 1, 'pp': 1, 'dp': 2, 'grid_offset': 0},
+            {'name': 'encoder_2', 'tp': 1, 'pp': 1, 'dp': 2, 'grid_offset': 0},
+        ]
+        llm_config = {'tp': 2, 'pp': 1, 'dp': 1, 'grid_offset': 2}
+
+        run_multimodule_schedule_test(
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=4,
+        )
+
+    def test_dual_encoder_4gpu(self):
+        print(f"for debug, rank {dist.get_rank()}, in test_dual_encoder_4gpu")
+        """Test dual encoder + LLM on 4 GPUs (TP=2, PP=2 for each)."""
+        if self.world_size != 4:
+            pytest.skip(f"Requires 4 GPUs, got {self.world_size}")
+
+        encoder_configs = [
+            {'name': 'encoder_1', 'tp': 2, 'pp': 1, 'dp': 1, 'grid_offset': 0},
+            {'name': 'encoder_2', 'tp': 2, 'pp': 1, 'dp': 1, 'grid_offset': 0},
+        ]
+        llm_config = {'tp': 2, 'pp': 1, 'dp': 1, 'grid_offset': 2}
+
+        run_multimodule_schedule_test(
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=8,
+        )
+        print(f"for debug, rank {dist.get_rank()}, after test_dual_encoder_4gpu")
