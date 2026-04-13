@@ -162,7 +162,13 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if (
+            self.position_embedding_type == 'rope'
+            and not self.config.multi_latent_attention
+            and not getattr(self.config, 'rotary_base_per_layer', None)
+        ):
+            # Per-layer theta: each SelfAttention creates its own RotaryEmbedding,
+            # so no shared module is needed at the model level.
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,

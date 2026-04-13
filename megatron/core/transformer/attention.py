@@ -937,6 +937,11 @@ class Attention(MegatronModule, ABC):
         if no_rope:
             rotary_pos_emb = None
 
+        # Per-layer theta: override the model-level RoPE with this layer's own embedding.
+        if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
+            seq_len = rotary_pos_emb.shape[0]
+            rotary_pos_emb = self.rotary_pos_emb(seq_len)
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
@@ -1214,11 +1219,23 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Output gate
+        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
+
+        # Per-head scalar gate (attention_per_head_gate: separate linear_gate module)
+        if self.linear_gate is not None:
+            nvtx_range_push(suffix="per_head_gate")
+            per_head_gate, _ = self.linear_gate(hidden_states)  # [sq, b, np_per_rank]
+            per_head_gate = per_head_gate.view(*per_head_gate.shape[:2], -1, 1)  # [sq, b, np, 1]
+            core_attn_out = core_attn_out.view(*per_head_gate.shape[:3], -1)     # [sq, b, np, hn]
+            core_attn_out = (
+                core_attn_out * torch.sigmoid(per_head_gate.float()).to(core_attn_out.dtype)
+            )
+            core_attn_out = core_attn_out.view(*per_head_gate.shape[:2], -1)     # [sq, b, np*hn]
+            nvtx_range_pop(suffix="per_head_gate")
 
         # =================
         # Output. [sq, b, h]
@@ -1315,6 +1332,34 @@ class SelfAttention(Attention):
             )
         else:
             self.k_layernorm = None
+
+        # Per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
+        # Separate ColumnParallelLinear so gate weights are independent of QKV.
+        self.linear_gate = None
+        if self.config.attention_per_head_gate:
+            self.linear_gate = submodules.linear_qkv(
+                self.config.hidden_size,
+                self.config.num_attention_heads,
+                config=self.config,
+                init_method=not_none(self.config.init_method),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='gate',
+                tp_group=self.pg_collection.tp,
+            )
+
+        # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
+        self.rotary_pos_emb = None
+        if getattr(self.config, 'rotary_base_per_layer', None):
+            from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=getattr(self.config, 'rotary_percent', 1.0),
+                rotary_base=self.config.rotary_base_per_layer[self.layer_number - 1],
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
