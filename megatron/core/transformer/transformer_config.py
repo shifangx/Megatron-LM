@@ -2534,9 +2534,9 @@ class TransformerConfig(ModelParallelConfig):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.rotary_base_per_layer is not None:
-            assert len(self.rotary_base_per_layer) == self.num_layers, (
+            assert len(self.rotary_base_per_layer) == self.num_layers + self.mtp_num_layers, (
                 f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
-                f"must equal num_layers ({self.num_layers})"
+                f"must equal num_layers ({self.num_layers}) + mtp_num_layers ({self.mtp_num_layers})"
             )
 
         if self.no_rope_freq:
