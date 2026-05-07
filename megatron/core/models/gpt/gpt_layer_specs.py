@@ -666,9 +666,9 @@ def get_gpt_decoder_layer_specs(
         ]
     elif isinstance(config.moe_layer_freq, list):
         moe_layer_pattern = config.moe_layer_freq
-        assert len(moe_layer_pattern) == config.num_layers, (
+        assert len(moe_layer_pattern) == config.num_layers or len(moe_layer_pattern) == config.num_layers + config.mtp_num_layers, (
             f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-            f"expected {config.num_layers}, "
+            f"expected {config.num_layers + config.mtp_num_layers} or {config.num_layers}, "
             f"current moe layer pattern: {config.moe_layer_freq}"
         )
     else:
