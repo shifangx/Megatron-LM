@@ -778,6 +778,8 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = copy.copy(spec.layer_specs[-1])
+        print(f"for debug, in get_gpt_mtp_block_spec_for_backend, type(spec.layer_specs): {type(spec.layer_specs)}")
+        print(f"for debug, in get_gpt_mtp_block_spec_for_backend, transformer_layer_spec: {transformer_layer_spec}")
     elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
         transformer_layer_spec = copy.copy(spec)
     else:
