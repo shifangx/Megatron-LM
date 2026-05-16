@@ -1427,9 +1427,9 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
             return_layernorm_output=True,
         )
-        print(f"in SelfAttention, __init__, self.linear_qkv: {self.linear_qkv}")
-        print(f"in SelfAttention, __init__, self.linear_qkv.return_layernorm_output: {self.linear_qkv.return_layernorm_output}")
-        print(f"in SelfAttention, __init__, self.linear_qkv.return_bias: {self.linear_qkv.return_bias}")
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv: {self.linear_qkv}")
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_layernorm_output: {self.linear_qkv.return_layernorm_output}")
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_bias: {self.linear_qkv.return_bias}")
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = submodules.q_layernorm(
@@ -1538,7 +1538,11 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _, _ = apply_module(self.linear_qkv)(hidden_states)
+        mixed_qkv, bias, ln_output = apply_module(self.linear_qkv)(hidden_states)
+        print(f"for debug, in SelfAttention, get_query_key_value_tensors, hidden_states: {hidden_states}")
+        print(f"for debug, in SelfAttention, get_query_key_value_tensors, mixed_qkv: {mixed_qkv}")
+        print(f"for debug, in SelfAttention, get_query_key_value_tensors, ln_output: {ln_output}")
+        print(f"for debug, in SelfAttention, get_query_key_value_tensors, bias: {bias}")
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
