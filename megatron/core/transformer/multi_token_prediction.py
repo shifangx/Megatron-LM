@@ -758,7 +758,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.submodules = submodules
         # start from the last decoder layer
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage) + config.num_layers
-        print(f"for debug, in MultiTokenPredictionLayer, layer_number: {self.layer_number}")
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None

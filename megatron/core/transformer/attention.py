@@ -1427,9 +1427,9 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
             return_layernorm_output=True,
         )
+        print(f"for debug, in SelfAttention, __init__, self.layer_number: {self.layer_number}")
         print(f"for debug, in SelfAttention, __init__, self.linear_qkv: {self.linear_qkv}")
         print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_layernorm_output: {self.linear_qkv.return_layernorm_output}")
-        print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_bias: {self.linear_qkv.return_bias}")
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = submodules.q_layernorm(
