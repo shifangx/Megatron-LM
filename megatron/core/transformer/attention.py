@@ -1334,7 +1334,7 @@ class Attention(MegatronModule, ABC):
         # Per-head scalar gate (attention_per_head_gate: separate per_head_gate module)
         if self.config.use_head_wise_attn_gate:
             nvtx_range_push(suffix="head_wise_attn_gate")
-            gate_states, _ = self.g_proj(hidden_states)  # [sq, b, np_per_rank]
+            gate_states, _, _ = self.g_proj(hidden_states)  # [sq, b, np_per_rank]
             gate_states = gate_states.view(*gate_states.shape[:2], -1, 1)  # [sq, b, np, 1]
             core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)     # [sq, b, np, hn]
             core_attn_out = (
@@ -1425,7 +1425,11 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            return_layernorm_output=True,
         )
+        print(f"in SelfAttention, __init__, self.linear_qkv: {self.linear_qkv}")
+        print(f"in SelfAttention, __init__, self.linear_qkv.return_layernorm_output: {self.linear_qkv.return_layernorm_output}")
+        print(f"in SelfAttention, __init__, self.linear_qkv.return_bias: {self.linear_qkv.return_bias}")
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = submodules.q_layernorm(
@@ -1534,7 +1538,7 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        mixed_qkv, _, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )

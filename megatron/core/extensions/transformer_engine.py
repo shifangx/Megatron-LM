@@ -926,6 +926,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
+        return_layernorm_output: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1038,7 +1039,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode="column",
-            return_layernorm_output=False,
+            return_layernorm_output=return_layernorm_output,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **extra_kwargs,
         )
@@ -1101,9 +1102,19 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
         # values regardless of the arguments.
+        ln_output = None
+        bias = None
         if self.te_return_bias:
-            return out
-        return out, None
+            if self.return_layernorm_output:
+                out_hidden, bias, ln_output = out
+            else:
+                out_hidden, bias = out
+        else:
+            if self.return_layernorm_output:
+                out_hidden, ln_output = out
+            else:
+                out_hidden = out
+        return out_hidden, bias, ln_output
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
