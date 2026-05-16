@@ -1500,7 +1500,11 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            return_layernorm_output=True,
         )
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv: {self.linear_qkv}")
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_layernorm_output: {self.linear_qkv.return_layernorm_output}")
+        print(f"for debug, in SelfAttention, __init__, self.linear_qkv.return_bias: {self.linear_qkv.return_bias}")
 
         if self.config.head_wise_attn_gate:
             # Bias gate rows to sigmoid~=1 at init (approximate identity);
@@ -1655,7 +1659,7 @@ class SelfAttention(Attention):
             assert split_qkv and self.config.head_wise_attn_gate
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        mixed_qkv, _, _ = apply_module(self.linear_qkv)(hidden_states)
 
         # Peel the trailing per-rank gate scalars before any reshape / AG.
         # Correct only because (a) ColumnParallelLinear splits axis 0
@@ -1675,6 +1679,7 @@ class SelfAttention(Attention):
             # fail with "view size is not compatible with input tensor's size
             # and stride." Materialize a contiguous QKV slab here.
             mixed_qkv = mixed_qkv.contiguous()
+
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )

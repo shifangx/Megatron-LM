@@ -245,7 +245,7 @@ class MLP(MegatronModule):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
+        intermediate_parallel, bias_parallel, _ = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
