@@ -1542,10 +1542,6 @@ class SelfAttention(Attention):
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, bias, ln_output = apply_module(self.linear_qkv)(hidden_states)
-        print(f"for debug, in SelfAttention, get_query_key_value_tensors, hidden_states: {hidden_states}")
-        print(f"for debug, in SelfAttention, get_query_key_value_tensors, mixed_qkv: {mixed_qkv}")
-        print(f"for debug, in SelfAttention, get_query_key_value_tensors, ln_output: {ln_output}")
-        print(f"for debug, in SelfAttention, get_query_key_value_tensors, bias: {bias}")
 
         # Peel off the fused per-head gate (use_head_wise_attn_gate). Under TP,
         # ColumnParallelLinear splits the trailing num_attention_heads rows
