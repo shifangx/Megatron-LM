@@ -73,6 +73,7 @@ class RotaryEmbedding(nn.Module):
         if rotary_percent < 1.0:
             dim = int(dim * rotary_percent)
         self.rotary_interleaved = rotary_interleaved
+        print(f"for debug, in RotaryEmbedding, dim: {dim}, rotary_percent: {rotary_percent}, rotary_base: {rotary_base}, rotary_interleaved: {rotary_interleaved}")
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()

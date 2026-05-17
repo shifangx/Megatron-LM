@@ -381,6 +381,7 @@ class Attention(MegatronModule, ABC):
 
         # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
         self.rotary_pos_emb = None
+        print(f"for debug, in Attention, __init__, rank:{torch.distributed.get_rank()}, self.layer_number: {self.layer_number}, self.config.position_embedding_type: {self.config.position_embedding_type}, self.config.rotary_base_per_layer[self.layer_number - 1]: {self.config.rotary_base_per_layer[self.layer_number - 1]}")
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
