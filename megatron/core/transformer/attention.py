@@ -1267,62 +1267,64 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
-        # ================================================
-        # relative positional embedding (rotary embedding)
-        # ================================================
-        nvtx_range_push(suffix="rotary_pos_emb")
-        if rotary_pos_emb is not None and (
-            not self.config.flash_decode or inference_context is None
-        ):
-            q_pos_emb, k_pos_emb = rotary_pos_emb
+        # # ================================================
+        # # relative positional embedding (rotary embedding)
+        # # ================================================
+        # nvtx_range_push(suffix="rotary_pos_emb")
+        # if rotary_pos_emb is not None and (
+        #     not self.config.flash_decode or inference_context is None
+        # ):
+        #     q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-                else:
-                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                if packed_seq_params.cu_seqlens_kv_padded is not None:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-                else:
-                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-            else:
-                cu_seqlens_q = cu_seqlens_kv = None
+        #     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        #         if packed_seq_params.cu_seqlens_q_padded is not None:
+        #             cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+        #         else:
+        #             cu_seqlens_q = packed_seq_params.cu_seqlens_q
+        #         if packed_seq_params.cu_seqlens_kv_padded is not None:
+        #             cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+        #         else:
+        #             cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        #     else:
+        #         cu_seqlens_q = cu_seqlens_kv = None
 
-            if split_qkv:
-                if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
-                            config=self.config,
-                            cu_seqlens=cu_seqlens_q,
-                            mscale=_yarn_get_concentration_factor_from_config(self.config),
-                            cp_group=self.pg_collection.cp,
-                        )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
-            else:
-                query, key, value = apply_fused_qkv_rotary_pos_emb(
-                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
-                )
+        #     if split_qkv:
+        #         if q_pos_emb is not None:
+        #             # TODO VIJAY: simplify
+        #             if inference_context is None or inference_context.is_static_batching():
+        #                 print(f"for debug, in attention.py, apply_rotary_pos_emb, ")
+        #                 query = apply_rotary_pos_emb(
+        #                     query,
+        #                     q_pos_emb,
+        #                     config=self.config,
+        #                     cu_seqlens=cu_seqlens_q,
+        #                     mscale=_yarn_get_concentration_factor_from_config(self.config),
+        #                     cp_group=self.pg_collection.cp,
+        #                 )
+        #             else:
+        #                 print(f"for debug, in attention.py, inference_context.apply_rotary_emb_query")
+        #                 query = inference_context.apply_rotary_emb_query(
+        #                     query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+        #                 )
+        #         if k_pos_emb is not None:
+        #             key = apply_rotary_pos_emb(
+        #                 key,
+        #                 k_pos_emb,
+        #                 config=self.config,
+        #                 cu_seqlens=cu_seqlens_kv,
+        #                 mscale=_yarn_get_concentration_factor_from_config(self.config),
+        #                 cp_group=self.pg_collection.cp,
+        #             )
+        #     else:
+        #         query, key, value = apply_fused_qkv_rotary_pos_emb(
+        #             mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+        #         )
 
-            # TODO, can apply positional embedding to value_layer so it has
-            # absolute positional embedding.
-            # otherwise, only relative positional embedding takes effect
-            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        nvtx_range_pop(suffix="rotary_pos_emb")
+        #     # TODO, can apply positional embedding to value_layer so it has
+        #     # absolute positional embedding.
+        #     # otherwise, only relative positional embedding takes effect
+        #     # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        # nvtx_range_pop(suffix="rotary_pos_emb")
 
         # ==================================
         # core attention computation
