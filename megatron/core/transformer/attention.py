@@ -1655,7 +1655,7 @@ class SelfAttention(Attention):
             assert split_qkv and self.config.head_wise_attn_gate
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        mixed_qkv, _, _ = apply_module(self.linear_qkv)(hidden_states)
 
         # Peel the trailing per-rank gate scalars before any reshape / AG.
         # Correct only because (a) ColumnParallelLinear splits axis 0
