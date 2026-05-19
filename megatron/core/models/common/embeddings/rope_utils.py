@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from typing import TYPE_CHECKING, Optional
 
@@ -16,6 +17,24 @@ from torch import Tensor
 from megatron.core import parallel_state
 
 logger = logging.getLogger(__name__)
+
+
+def _rope_compute_in_fp32() -> bool:
+    """Whether to apply rotary embedding in fp32 (matches SteptronOss bit-for-bit).
+
+    Controlled by the ``MEGATRON_ROPE_FP32`` environment variable, read on every call so
+    the flag can be toggled at runtime without re-importing.
+
+    Values:
+        - ``"1"`` / ``"true"`` / ``"yes"``: fp32 path — keep cos/sin in fp32, promote
+          ``t`` to fp32 for the rotate, then cast the rotated tensor back to the input
+          dtype. Matches SteptronOss ``YARNRoPE.forward``.
+        - ``"0"`` / ``"false"`` / ``"no"`` (**default**): original Megatron path — cast
+          cos/sin down to ``t.dtype`` and do the multiply-add in ``t.dtype`` (typically
+          bf16). Reproduces the pre-alignment behaviour.
+    """
+    return os.environ.get("MEGATRON_ROPE_FP32", "0").lower() in ("1", "true", "yes")
+
 
 try:
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
@@ -139,12 +158,26 @@ def _apply_rotary_pos_emb_bshd(
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
-    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
-    if inverse:
-        sin_ = -sin_
+    # Compute precision is controlled by MEGATRON_ROPE_FP32 (see _rope_compute_in_fp32).
+    # fp32 path: keep cos/sin in fp32, promote t to fp32 for the rotate, cast back —
+    # matches SteptronOss YARNRoPE.forward bit-for-bit.
+    if _rope_compute_in_fp32():
+        in_dtype = t.dtype
+        cos_ = (torch.cos(freqs) * mscale).to(torch.float32)
+        sin_ = (torch.sin(freqs) * mscale).to(torch.float32)
+        if inverse:
+            sin_ = -sin_
 
-    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+        t_fp32 = t.float()
+        t_fp32 = (t_fp32 * cos_) + (_rotate_half(t_fp32, rotary_interleaved) * sin_)
+        t = t_fp32.to(in_dtype)
+    else:
+        cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
+        sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+        if inverse:
+            sin_ = -sin_
+
+        t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
 
     # Fallback to original permutation
     # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
