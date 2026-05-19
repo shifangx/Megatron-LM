@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -557,6 +558,87 @@ class Attention(MegatronModule, ABC):
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
         )
+
+    def _step_rope_get_cos_sin(self, rot_dim: int, device: torch.device):
+        """Build/retrieve YARN cos/sin cache matching SteptronOss YARNRoPE.
+
+        Returns cos_cache, sin_cache of shape [max_seq, rot_dim].
+        """
+        theta = float(getattr(self.config, "rotary_base", 10000.0))
+        max_seq = int(
+            getattr(self.config, "max_position_embeddings", None)
+            or getattr(self.config, "seq_length", None)
+            or 8192
+        )
+        ntk_ratio = float(getattr(self.config, "ntk_interp_ratio", 1.0))
+        beta_slow = float(getattr(self.config, "yarn_beta_slow", 1.0))
+        beta_fast = float(getattr(self.config, "yarn_beta_fast", 32.0))
+
+        key = (rot_dim, str(device), theta, max_seq, ntk_ratio, beta_slow, beta_fast)
+        cache = getattr(self, "_step_rope_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+
+        cv = rot_dim // 2
+        # ropen_linspace(0, 1, cv) == linspace(0, 1, cv + 1)[:-1]
+        lin = torch.linspace(0, 1, cv + 1, device=device, dtype=torch.float32)[:-1]
+        base_freqs = 1.0 / (theta ** lin)
+        if ntk_ratio == 1.0:
+            freqs = base_freqs
+        else:
+            ntk_freqs = base_freqs / ntk_ratio
+            ntk_weight = (
+                (max_seq / (2 * math.pi / base_freqs) - beta_slow) / (beta_fast - beta_slow)
+            ).clamp(0, 1)
+            freqs = base_freqs * ntk_weight + ntk_freqs * (1 - ntk_weight)
+
+        angles = torch.outer(
+            torch.arange(max_seq, device=device, dtype=torch.float32), freqs
+        )  # [S, cv]
+        repeated = angles.repeat(1, 2)  # [S, rot_dim]
+        cos_cache = repeated.cos().to(torch.float32)
+        sin_cache = repeated.sin().to(torch.float32)
+        self._step_rope_cache = (key, cos_cache, sin_cache)
+        return cos_cache, sin_cache
+
+    def forward_rope(self, q: Tensor, k: Tensor, pos_id_q: Tensor, pos_id_k: Tensor):
+        """Apply RoPE matching SteptronOss `forward_rope` + `YARNRoPE.forward`.
+
+        Args:
+            q, k: query/key in sbhd layout, shape ``[s, b, h, c]``.
+            pos_id_q, pos_id_k: 1-D LongTensor, shape ``[s]``.
+
+        Returns:
+            (q, k) with rope applied. If ``qk_rope_head_dim`` differs from
+            ``head_dim``, rope is applied only to the first ``rot_dim``
+            channels and the no-rope tail is concatenated back.
+        """
+        head_dim = q.shape[-1]
+        rot_dim = getattr(self.config, "qk_rope_head_dim", None) or head_dim
+
+        cos_cache, sin_cache = self._step_rope_get_cos_sin(rot_dim, q.device)
+
+        def _rope(feat: Tensor, pos_id: Tensor) -> Tensor:
+            # feat: [s, b, h, c]; pos_id: [s]
+            cos = cos_cache[pos_id][:, None, None, :]  # [s, 1, 1, c]
+            sin = sin_cache[pos_id][:, None, None, :]
+            half = feat.shape[-1] // 2
+            x1 = feat[..., :half]
+            x2 = feat[..., half:]
+            rotated = torch.cat((-x2, x1), dim=-1)
+            dtype = feat.dtype
+            out = feat.to(torch.float32) * cos + rotated.to(torch.float32) * sin
+            return out.to(dtype)
+
+        if rot_dim != head_dim:
+            q_rope, q_nope = torch.split(q, [rot_dim, head_dim - rot_dim], dim=-1)
+            k_rope, k_nope = torch.split(k, [rot_dim, head_dim - rot_dim], dim=-1)
+            q = torch.cat([_rope(q_rope, pos_id_q), q_nope], dim=-1)
+            k = torch.cat([_rope(k_rope, pos_id_k), k_nope], dim=-1)
+        else:
+            q = _rope(q, pos_id_q)
+            k = _rope(k, pos_id_k)
+        return q, k
 
     def _adjust_key_value_for_inference(
         self,
@@ -1267,64 +1349,55 @@ class Attention(MegatronModule, ABC):
             value = value.squeeze(1)
         nvtx_range_pop(suffix="adjust_key_value")
 
-        # # ================================================
-        # # relative positional embedding (rotary embedding)
-        # # ================================================
-        # nvtx_range_push(suffix="rotary_pos_emb")
-        # if rotary_pos_emb is not None and (
-        #     not self.config.flash_decode or inference_context is None
-        # ):
-        #     q_pos_emb, k_pos_emb = rotary_pos_emb
 
-        #     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-        #         if packed_seq_params.cu_seqlens_q_padded is not None:
-        #             cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
-        #         else:
-        #             cu_seqlens_q = packed_seq_params.cu_seqlens_q
-        #         if packed_seq_params.cu_seqlens_kv_padded is not None:
-        #             cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
-        #         else:
-        #             cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-        #     else:
-        #         cu_seqlens_q = cu_seqlens_kv = None
+        # ================================================
+        # relative positional embedding (SteptronOss-style rope)
+        # ================================================
+        nvtx_range_push(suffix="rotary_pos_emb")
+        if rotary_pos_emb is not None and (
+            not self.config.flash_decode or inference_context is None
+        ):
+            assert split_qkv, "SteptronOss-style forward_rope requires split_qkv path."
 
-        #     if split_qkv:
-        #         if q_pos_emb is not None:
-        #             # TODO VIJAY: simplify
-        #             if inference_context is None or inference_context.is_static_batching():
-        #                 print(f"for debug, in attention.py, apply_rotary_pos_emb, ")
-        #                 query = apply_rotary_pos_emb(
-        #                     query,
-        #                     q_pos_emb,
-        #                     config=self.config,
-        #                     cu_seqlens=cu_seqlens_q,
-        #                     mscale=_yarn_get_concentration_factor_from_config(self.config),
-        #                     cp_group=self.pg_collection.cp,
-        #                 )
-        #             else:
-        #                 print(f"for debug, in attention.py, inference_context.apply_rotary_emb_query")
-        #                 query = inference_context.apply_rotary_emb_query(
-        #                     query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-        #                 )
-        #         if k_pos_emb is not None:
-        #             key = apply_rotary_pos_emb(
-        #                 key,
-        #                 k_pos_emb,
-        #                 config=self.config,
-        #                 cu_seqlens=cu_seqlens_kv,
-        #                 mscale=_yarn_get_concentration_factor_from_config(self.config),
-        #                 cp_group=self.pg_collection.cp,
-        #             )
-        #     else:
-        #         query, key, value = apply_fused_qkv_rotary_pos_emb(
-        #             mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
-        #         )
+            # ---- compute position_id ahead of time ----
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                else:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                if packed_seq_params.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                else:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
 
-        #     # TODO, can apply positional embedding to value_layer so it has
-        #     # absolute positional embedding.
-        #     # otherwise, only relative positional embedding takes effect
-        #     # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        # nvtx_range_pop(suffix="rotary_pos_emb")
+                q_seg_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+                k_seg_lens = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).tolist()
+                position_id_q = torch.cat(
+                    [
+                        torch.arange(int(L), dtype=torch.long, device=query.device)
+                        for L in q_seg_lens
+                    ]
+                )
+                position_id_k = torch.cat(
+                    [
+                        torch.arange(int(L), dtype=torch.long, device=key.device)
+                        for L in k_seg_lens
+                    ]
+                )
+                # In THD path, query/key were squeezed to [t, h, d] earlier;
+                # add a unit batch dim so forward_rope sees [s, 1, h, d].
+                query = query.unsqueeze(1)
+                key = key.unsqueeze(1)
+                query, key = self.forward_rope(query, key, position_id_q, position_id_k)
+                query = query.squeeze(1)
+                key = key.squeeze(1)
+            else:
+                s_q = query.shape[0]
+                s_k = key.shape[0]
+                position_id_q = torch.arange(s_q, dtype=torch.long, device=query.device)
+                position_id_k = torch.arange(s_k, dtype=torch.long, device=key.device)
+                query, key = self.forward_rope(query, key, position_id_q, position_id_k)
+        nvtx_range_pop(suffix="rotary_pos_emb")
 
         # ==================================
         # core attention computation
