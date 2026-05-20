@@ -108,6 +108,52 @@ def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
         return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
 
+def _maybe_load_cos_sin_override(
+    cos_: Tensor,
+    sin_: Tensor,
+    layer_id: Optional[int],
+    rope_call_kind: Optional[str],
+) -> tuple[Tensor, Tensor, bool]:
+    """When MEGATRON_LOAD_ROPE_PATH is set, replace cos_/sin_ with tensors saved by
+    SteptronOss YARNRoPE. Returns (cos_, sin_, overridden).
+
+    File naming matches SteptronOss save side: rope_layer{L:03d}_call{N}.pt where
+    N is 0 for q and 1 for k. Saved tensors have shape [1, S, 1, C] (SteptronOss
+    feature is BSHC). Megatron's bshd path expects [S, 1, 1, C], so we transpose
+    dims 0 and 1.
+    """
+    load_dir = os.environ.get("MEGATRON_LOAD_ROPE_PATH")
+    if not load_dir or layer_id is None or rope_call_kind is None:
+        return cos_, sin_, False
+
+    call_idx = {"q": 0, "k": 1}.get(rope_call_kind)
+    if call_idx is None:
+        return cos_, sin_, False
+
+    fname = os.path.join(load_dir, f"rope_layer{int(layer_id):03d}_call{call_idx}.pt")
+    if not os.path.exists(fname):
+        return cos_, sin_, False
+
+    data = torch.load(fname, map_location="cpu")
+    loaded_cos = data["cos"]
+    loaded_sin = data["sin"]
+
+    # SteptronOss saves [1, S, 1, C]; Megatron expects [S, 1, 1, C].
+    if loaded_cos.dim() == 4 and loaded_cos.shape[0] == 1 and loaded_cos.shape[2] == 1:
+        loaded_cos = loaded_cos.transpose(0, 1).contiguous()
+        loaded_sin = loaded_sin.transpose(0, 1).contiguous()
+
+    if loaded_cos.shape != cos_.shape:
+        raise RuntimeError(
+            f"MEGATRON_LOAD_ROPE_PATH: shape mismatch for {fname}: "
+            f"loaded {tuple(loaded_cos.shape)} vs expected {tuple(cos_.shape)}"
+        )
+
+    cos_ = loaded_cos.to(device=cos_.device, dtype=cos_.dtype)
+    sin_ = loaded_sin.to(device=sin_.device, dtype=sin_.dtype)
+    return cos_, sin_, True
+
+
 def _apply_rotary_pos_emb_bshd(
     t: Tensor,
     freqs: Tensor,
@@ -117,6 +163,8 @@ def _apply_rotary_pos_emb_bshd(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     multi_latent_attention: Optional[bool] = None,
+    layer_id: Optional[int] = None,
+    rope_call_kind: Optional[str] = None,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
@@ -165,6 +213,7 @@ def _apply_rotary_pos_emb_bshd(
         in_dtype = t.dtype
         cos_ = (torch.cos(freqs) * mscale).to(torch.float32)
         sin_ = (torch.sin(freqs) * mscale).to(torch.float32)
+        cos_, sin_, _ = _maybe_load_cos_sin_override(cos_, sin_, layer_id, rope_call_kind)
         if inverse:
             sin_ = -sin_
 
@@ -174,6 +223,7 @@ def _apply_rotary_pos_emb_bshd(
     else:
         cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
         sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+        cos_, sin_, _ = _maybe_load_cos_sin_override(cos_, sin_, layer_id, rope_call_kind)
         if inverse:
             sin_ = -sin_
 
@@ -249,6 +299,8 @@ def _apply_rotary_pos_emb_thd(
     mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
+    layer_id: Optional[int] = None,
+    rope_call_kind: Optional[str] = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -302,6 +354,8 @@ def _apply_rotary_pos_emb_thd(
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
+            layer_id=layer_id,
+            rope_call_kind=rope_call_kind,
         ).squeeze(1)
     else:
         # CASE 2: Traditional mapping without offsets
@@ -320,6 +374,8 @@ def _apply_rotary_pos_emb_thd(
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
+            layer_id=layer_id,
+            rope_call_kind=rope_call_kind,
         ).squeeze(1)
 
 
@@ -333,6 +389,8 @@ def apply_rotary_pos_emb(
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
+    layer_id: Optional[int] = None,
+    rope_call_kind: Optional[str] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -348,6 +406,9 @@ def apply_rotary_pos_emb(
         if cu_seqlens is None:
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False
+            # MEGATRON_LOAD_ROPE_PATH only takes effect on the unfused path — force it.
+            if os.environ.get("MEGATRON_LOAD_ROPE_PATH"):
+                use_unfused = True
             if config.mrope_section is not None and freqs.shape[1] > 1:
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
                 warnings.warn(
@@ -396,6 +457,8 @@ def apply_rotary_pos_emb(
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
+            layer_id=layer_id,
+            rope_call_kind=rope_call_kind,
         )
     else:
         return _apply_rotary_pos_emb_thd(
@@ -408,6 +471,8 @@ def apply_rotary_pos_emb(
             cp_group=cp_group,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
+            layer_id=layer_id,
+            rope_call_kind=rope_call_kind,
         )
 
 
