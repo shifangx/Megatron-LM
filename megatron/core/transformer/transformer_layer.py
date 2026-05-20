@@ -390,9 +390,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The conditional below is to make the logic explicit
         # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
         if isinstance(submodules.mlp, ModuleSpec):
-            if submodules.mlp.module in (MoELayer, TEGroupedMLP, SequentialMLP):
+            _mlp_cls = submodules.mlp.module
+            _is_moelayer_subclass = isinstance(_mlp_cls, type) and issubclass(_mlp_cls, MoELayer)
+            if _is_moelayer_subclass or _mlp_cls in (TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
-                if submodules.mlp.module == MoELayer:
+                if _is_moelayer_subclass:
                     # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
                     additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
                     # Pass layer number to MoELayer for router configuration.
@@ -770,6 +772,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if isinstance(pre_mlp_layernorm_output, tuple):
+            print(f"for debug, layer_number: {self.layer_number}, in _forward_mlp, pre_mlp_layernorm_output is a tuple")
             if len(pre_mlp_layernorm_output) != 2:
                 raise ValueError(
                     f"When the output of pre_mlp_layernorm is a tuple, it is "
@@ -778,6 +781,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
+            print(f"for debug, layer_number: {self.layer_number}, in _forward_mlp, pre_mlp_layernorm_output is not a tuple")
             # Residual connection.
             residual = hidden_states
 
