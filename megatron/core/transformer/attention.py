@@ -1399,12 +1399,22 @@ class Attention(MegatronModule, ABC):
 
         if head_wise_gate is not None:
             nvtx_range_push(suffix="head_wise_attn_gate")
-            gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
-            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
-            core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
-                core_attn_out.dtype
-            )
-            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
+            if getattr(self.linear_proj, "_apply_head_wise_gate_internally", False):
+                # Debug path: a downstream linear_proj_debug class will apply the
+                # head-wise gate inside its own forward (mirroring SteptronOss's
+                # wo, which applies the gate inside the GEMM autograd.Function via
+                # custom_pre_recompute_function). We forward the gate tensor by
+                # attribute injection so the linear_proj input hook captures the
+                # pre-gate tensor — same semantic location as SteptronOss's
+                # attention_preproj dump.
+                self.linear_proj._pending_head_wise_gate = head_wise_gate
+            else:
+                gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
+                core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
+                core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
+                    core_attn_out.dtype
+                )
+                core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
             nvtx_range_pop(suffix="head_wise_attn_gate")
 
         # Output gate (attention_output_gate: full head_dim gate fused into QKV)
