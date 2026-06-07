@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 from typing import TYPE_CHECKING, Optional
 
@@ -89,6 +91,91 @@ def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
         return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
 
+# Cache: layer_idx + call_idx -> (cos[s,1,1,d], sin[s,1,1,d]) on CUDA.
+# Populated lazily on the first call for each (layer, q/k) pair; the saved
+# tensors are constant across forwards once SteptronOss writes them.
+_STEPTRON_ROPE_CACHE: dict = {}
+
+
+def _find_self_attention_in_stack():
+    """Walk back through Python frames to find the SelfAttention instance
+    whose ``forward`` is calling into ``apply_rotary_pos_emb``. Step3.5 sets
+    ``_layer_idx`` on it in ``Step35DecoderLayer.__init__`` (and a
+    ``_rope_call_counter`` pre-hook); returns ``None`` when neither is
+    present, leaving the standard RoPE path untouched.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        f_self = frame.f_locals.get("self", None)
+        if (
+            f_self is not None
+            and hasattr(f_self, "_layer_idx")
+            and hasattr(f_self, "_rope_call_counter")
+        ):
+            return f_self
+        frame = frame.f_back
+    return None
+
+
+def _apply_rotary_pos_emb_bshd_from_steptron(
+    t: Tensor, freqs: Tensor, attn_module, rotary_interleaved: bool
+) -> Optional[Tensor]:
+    """Override the cos/sin used by the unfused RoPE with tensors dumped by
+    SteptronOss (file naming: ``rope_layer{L:03d}_call{N}.pt``; N=0 is q,
+    N=1 is k). This matches the steptron compute exactly: fp32 cos/sin,
+    fp32 multiply, then cast back to ``t.dtype`` — the same body as
+    ``YARNRoPE.forward`` in ``steptronoss/model/common/rope.py``.
+
+    Returns ``None`` if the cos/sin file is missing — caller falls back to
+    the normal compute path. Otherwise returns the rotated tensor (with
+    any non-rotated tail re-appended) in ``t.dtype``.
+    """
+    load_dir = os.environ.get("MEGATRON_LOAD_ROPE_PATH")
+    if not load_dir:
+        return None
+
+    layer_idx = int(getattr(attn_module, "_layer_idx"))
+    counter = int(getattr(attn_module, "_rope_call_counter", 0))
+    attn_module._rope_call_counter = counter + 1
+    call_idx = counter % 2  # 0=q, 1=k — mirrors YARNRoPE._maybe_save_cos_sin
+
+    key = (layer_idx, call_idx)
+    cached = _STEPTRON_ROPE_CACHE.get(key)
+    if cached is None:
+        fname = os.path.join(load_dir, f"rope_layer{layer_idx:03d}_call{call_idx}.pt")
+        if not os.path.exists(fname):
+            return None
+        # Loaded payload was saved as {"cos","sin","feature_shape","dim","theta",
+        # "layer_id","call_idx"} on CPU in float32 with shape [1, S, 1, C].
+        payload = torch.load(fname, map_location="cpu", weights_only=False)
+        # steptron feature layout is [B, S, H, C]; mbridge uses sbhd ([S, B, H, C]).
+        # Transpose first two dims so the cache broadcasts against t directly.
+        cos = payload["cos"].to(device=t.device, dtype=torch.float32).transpose(0, 1).contiguous()
+        sin = payload["sin"].to(device=t.device, dtype=torch.float32).transpose(0, 1).contiguous()
+        _STEPTRON_ROPE_CACHE[key] = (cos, sin)
+        cached = (cos, sin)
+    cos, sin = cached
+
+    rot_dim = cos.shape[-1]
+    if freqs.shape[-1] != rot_dim:
+        # The saved cos/sin must align with the rotated portion size used by
+        # Megatron (freqs.shape[-1] is exactly that). A mismatch is a config
+        # bug — fail loudly so we don't silently produce wrong RoPE.
+        raise RuntimeError(
+            f"steptron rope cos last-dim {rot_dim} != mbridge freqs last-dim "
+            f"{freqs.shape[-1]} for layer {layer_idx} call {call_idx}"
+        )
+
+    t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+    in_dtype = t_rot.dtype
+    t_rot_f32 = t_rot.float()
+    rotated = t_rot_f32 * cos + _rotate_half(t_rot_f32, rotary_interleaved) * sin
+    rotated = rotated.to(in_dtype)
+    if t_pass.numel() == 0:
+        return rotated
+    return torch.cat((rotated, t_pass), dim=-1)
+
+
 def _apply_rotary_pos_emb_bshd(
     t: Tensor,
     freqs: Tensor,
@@ -126,6 +213,21 @@ def _apply_rotary_pos_emb_bshd(
     # keep freqs rank aligned with t.
     if freqs.dim() == t.dim() + 1 and freqs.size(-2) == 1:
         freqs = freqs.squeeze(-2)
+
+    # MEGATRON_LOAD_ROPE_PATH override: replace the computed cos/sin with
+    # SteptronOss's dumped per-(layer, q/k) tensors to isolate RoPE input
+    # divergence in bit-level alignment runs. Skipped when the env var is
+    # unset, when no SelfAttention with ``_layer_idx`` / ``_rope_call_counter``
+    # is on the call stack, or when the saved file doesn't exist for this
+    # (layer, call) pair.
+    if os.environ.get("MEGATRON_LOAD_ROPE_PATH"):
+        attn_module = _find_self_attention_in_stack()
+        if attn_module is not None:
+            override = _apply_rotary_pos_emb_bshd_from_steptron(
+                t, freqs, attn_module, rotary_interleaved
+            )
+            if override is not None:
+                return override
 
     rot_dim = freqs.shape[-1]
 
@@ -311,7 +413,17 @@ def apply_rotary_pos_emb(
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
 
-    if config.apply_rope_fusion:
+    # Force the unfused implementation when the SteptronOss cos/sin override
+    # is active — the override only fires inside ``_apply_rotary_pos_emb_bshd``
+    # / ``_apply_rotary_pos_emb_thd``.
+    if os.environ.get("MEGATRON_LOAD_ROPE_PATH") and config.apply_rope_fusion:
+        # Local copy of the config-driven flag is sufficient since the branch
+        # below only reads ``config.apply_rope_fusion`` once.
+        config_apply_rope_fusion = False
+    else:
+        config_apply_rope_fusion = config.apply_rope_fusion
+
+    if config_apply_rope_fusion:
         if cu_seqlens is None:
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False
