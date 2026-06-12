@@ -123,11 +123,23 @@ class PipelineParallelLayerLayout:
                     LayerType.mtp not in self.layout[pp_rank][vpp_rank]
                 ), f"Currently we restrict that the MTP should be always in the last "
                 f"virtual pipeline stage of that rank. But got {self.layout[pp_rank][vpp_rank]}"
-        for pp_rank in range(self.pipeline_model_parallel_size):
-            if LayerType.mtp in self.layout[pp_rank][-1]:
-                assert (
-                    self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
-                ), "All of the MTP layers must be in the same one virtual pipeline stage"
+        # Detect mtp_split vs mtp_standalone.
+        # mtp_standalone: all mtp_num_layers reside on a single PP rank.
+        # mtp_split: MTP layers are distributed across multiple consecutive PP ranks,
+        #   each holding ≥1 layer in any combination (uniform or non-uniform).
+        #   The total across all MTP ranks must equal mtp_num_layers (verified above).
+        mtp_ranks_with_layers = [
+            pp_rank
+            for pp_rank in range(self.pipeline_model_parallel_size)
+            if LayerType.mtp in self.layout[pp_rank][-1]
+        ]
+        num_mtp_pp_ranks = len(mtp_ranks_with_layers)
+        if num_mtp_pp_ranks == 1:
+            # mtp_standalone: one PP rank holds all MTP layers
+            pp_rank = mtp_ranks_with_layers[0]
+            assert self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers, (
+                "All of the MTP layers must be in the same one virtual pipeline stage"
+            )
         for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
             assert LayerType.mtp not in self.layout[0][vpp_rank], (
                 f"Currently we restrict that the MTP should not be in the first pp rank."
