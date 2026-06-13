@@ -894,6 +894,7 @@ def process_mtp_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
+    num_chunks_override: Optional[int] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -923,7 +924,8 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+    num_mtp_chunks = (num_chunks_override - 1) if num_chunks_override is not None else config.mtp_num_layers
+    hidden_states_list = torch.chunk(hidden_states, 1 + num_mtp_chunks, dim=0)
     hidden_states = hidden_states_list[0]
 
     # When labels are not provided (e.g. RL training), derive them from input_ids by
@@ -962,7 +964,7 @@ def process_mtp_loss(
     fuse_linear_cross_entropy = (
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
     )
-    for mtp_layer_number in range(config.mtp_num_layers):
+    for mtp_layer_number in range(num_mtp_chunks):
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
@@ -1031,6 +1033,148 @@ def process_mtp_loss(
             )
 
     return hidden_states
+
+
+def process_mtp_loss_nonfinal_stage(
+    hidden_states: Tensor,
+    n_chunks_to_keep: int,
+    labels: Tensor,
+    loss_mask: Optional[Tensor],
+    output_layer: Callable,
+    output_weight: Optional[Tensor],
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    compute_language_model_loss: Callable,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    input_ids: Optional[Tensor] = None,
+) -> Tensor:
+    """Process MTP loss for a non-final loss-split pipeline stage.
+
+    Receives the full hidden-state concat [main, mtp0, ..., mtpN-1], computes losses
+    for the HIGH-indexed chunks (those above n_chunks_to_keep), attaches them to the
+    main chunk via MTPLossAutoScaler, and returns only the LOW-indexed prefix
+    cat([hs_0, ..., hs_{n_chunks_to_keep-1}]) to forward to the next loss stage.
+
+    Args:
+        hidden_states: Full [N*s, b, h] concat (N = 1 + config.mtp_num_layers).
+        n_chunks_to_keep: How many low-indexed chunks to keep and forward (e.g. 2 for
+            a 4-chunk tensor where the last 2 are processed here).
+    """
+    n_total = 1 + config.mtp_num_layers  # e.g. 4
+    n_process = n_total - n_chunks_to_keep  # number of high-indexed chunks to process
+
+    hidden_states_list = torch.chunk(hidden_states, n_total, dim=0)
+    main_hidden_states = hidden_states_list[0]
+
+    # Derive labels from input_ids if needed
+    derived_labels_from_input_ids = False
+    if labels is None:
+        if input_ids is None:
+            return torch.cat(list(hidden_states_list[:n_chunks_to_keep]), dim=0)
+        labels, _ = roll_tensor(
+            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        derived_labels_from_input_ids = True
+
+    if config.mtp_detach_heads:
+        if output_weight is not None:
+            output_weight = output_weight.detach()
+        else:
+            output_weight = output_layer.weight.detach()
+
+    mtp_labels = labels.clone()
+    if loss_mask is None:
+        loss_mask = torch.ones_like(mtp_labels)
+    if derived_labels_from_input_ids:
+        loss_mask, _ = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+
+    original_num_tokens = loss_mask.sum()
+
+    # Pre-roll labels and loss_mask by (n_chunks_to_keep - 1) steps so that the
+    # first iteration of the loop corresponds to the correct global MTP layer index.
+    for _ in range(n_chunks_to_keep - 1):
+        mtp_labels, _ = roll_tensor(
+            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        loss_mask, _ = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+
+    fuse_linear_cross_entropy = (
+        config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+    )
+
+    for local_i in range(n_process):
+        # global MTP layer index: (n_chunks_to_keep - 1) + local_i
+        global_mtp_layer_number = (n_chunks_to_keep - 1) + local_i
+        mtp_labels, _ = roll_tensor(
+            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        loss_mask, num_tokens = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        chunk_hs = hidden_states_list[n_chunks_to_keep + local_i]
+        if fuse_linear_cross_entropy:
+            mtp_loss = output_layer(
+                chunk_hs,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=mtp_labels,
+            )
+            mtp_logits = None
+        else:
+            mtp_logits, _ = output_layer(
+                chunk_hs,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_loss = loss_mask * mtp_loss
+
+        if is_training:
+            if mtp_logits is not None:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
+                )
+            else:
+                correct = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+                total = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                torch.sum(mtp_loss),
+                num_tokens,
+                global_mtp_layer_number,
+                config.mtp_num_layers,
+                correct=correct,
+                total=total,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+
+        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        if config.calculate_per_token_loss:
+            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            mtp_loss_normalized = (
+                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+            )
+            main_hidden_states = MTPLossAutoScaler.apply(main_hidden_states, mtp_loss_normalized)
+        else:
+            safe_num_tokens = num_tokens.clamp(min=1)
+            main_hidden_states = MTPLossAutoScaler.apply(
+                main_hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            )
+
+    # Return prefix: replace hs_0 with the updated main_hidden_states (which has loss attached),
+    # then concatenate the prefix chunks.
+    prefix_chunks = [main_hidden_states] + list(hidden_states_list[1:n_chunks_to_keep])
+    return torch.cat(prefix_chunks, dim=0)
 
 
 class MultiTokenPredictionLayer(MegatronModule):

@@ -212,7 +212,7 @@ class LanguageModule(MegatronModule):
         if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if (
-            self.post_process
+            (self.post_process or getattr(self, 'loss_split_process', False))
             and hasattr(self, 'output_layer')
             and self.output_layer.weight is not None
         ):

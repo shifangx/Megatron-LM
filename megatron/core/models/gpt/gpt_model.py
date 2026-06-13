@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
@@ -34,6 +34,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
     process_mtp_loss,
+    process_mtp_loss_nonfinal_stage,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -154,6 +155,22 @@ class GPTModel(LanguageModule):
             vp_stage=vp_stage,
         )
 
+        # Detect non-final loss-split stage (has L tokens but is not post_process).
+        self.loss_split_process = False
+        self.loss_split_n_keep = 0
+        self.loss_split_n_chunks_received = None
+
+        _layout = getattr(self.config, 'pipeline_model_parallel_layout', None)
+        if _layout is not None and getattr(self.config, 'mtp_num_layers', None) and _layout.is_mtp_loss_split():
+            _pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            _vp_stage = vp_stage if vp_stage is not None else 0
+            _is_nonfinal, _n_keep, _n_recv = _layout.get_loss_stage_info(_pp_rank, _vp_stage)
+            if _is_nonfinal:
+                self.loss_split_process = True
+                self.loss_split_n_keep = _n_keep
+            elif self.post_process and _n_recv > 0 and _n_recv < 1 + self.config.mtp_num_layers:
+                self.loss_split_n_chunks_received = _n_recv
+
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
             and self.config.cross_entropy_fusion_impl == "linear"
@@ -240,9 +257,9 @@ class GPTModel(LanguageModule):
             self._setup_mtp_cuda_graphs()
 
         # Output
-        if self.post_process:
+        if self.post_process or self.loss_split_process:
 
-            if self.config.defer_embedding_wgrad_compute:
+            if self.post_process and self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
                 # all the micro-batches of a global batch for the last pipeline stage. Once we are
@@ -253,7 +270,11 @@ class GPTModel(LanguageModule):
                 # final linear layer.
                 self.embedding_activation_buffer = []
                 self.grad_output_buffer = []
+            elif self.post_process:
+                self.embedding_activation_buffer = None
+                self.grad_output_buffer = None
             else:
+                # loss_split_process: no deferred embedding wgrad buffers needed
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
@@ -281,7 +302,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process or self.mtp_process:
+        if self.pre_process or self.post_process or self.mtp_process or self.loss_split_process:
             self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):
@@ -495,7 +516,7 @@ class GPTModel(LanguageModule):
             if self.mtp_process:
                 for param in self.mtp.parameters():
                     off_interface.mark_not_offload(param)
-            if self.post_process:
+            if self.post_process or self.loss_split_process:
                 for param in self.output_layer.parameters():
                     off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
@@ -685,6 +706,27 @@ class GPTModel(LanguageModule):
                 **(extra_block_kwargs or {}),
             )
 
+        # Non-final loss stage: compute partial MTP losses and forward prefix to next stage.
+        if self.loss_split_process and not (in_inference_mode or is_spec_decode):
+            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            hidden_states = process_mtp_loss_nonfinal_stage(
+                hidden_states=hidden_states,
+                n_chunks_to_keep=self.loss_split_n_keep,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                is_training=self.training,
+                compute_language_model_loss=self.compute_language_model_loss,
+                config=self.config,
+                cp_group=mtp_cp_group,
+                tp_group=self.tp_group,
+                packed_seq_params=packed_seq_params,
+                scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                input_ids=input_ids,
+            )
+
         if not self.post_process:
             return hidden_states
 
@@ -712,6 +754,7 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    num_chunks_override=self.loss_split_n_chunks_received,
                 )
         sequence_parallel_override = False
 

@@ -102,7 +102,14 @@ class PipelineParallelLayerLayout:
         assert (
             self.flatten_layout.count(LayerType.embedding) == 1
         ), "Embedding must be specified exactly once"
-        assert self.flatten_layout.count(LayerType.loss) == 1, "Loss must be specified exactly once"
+        num_loss = self.flatten_layout.count(LayerType.loss)
+        if num_loss > 1:
+            assert mtp_num_layers is not None and num_loss == 1 + mtp_num_layers, (
+                f"When using mtp_loss_split, the number of loss slots ({num_loss}) "
+                f"must equal 1 + mtp_num_layers ({1 + (mtp_num_layers or 0)})"
+            )
+        else:
+            assert num_loss == 1, "Loss must be specified exactly once"
         assert self.flatten_layout.count(LayerType.decoder) == num_layers, (
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
             f"must match num_layers {num_layers}"
@@ -160,6 +167,53 @@ class PipelineParallelLayerLayout:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
 
         return mtp_standalone
+
+    def is_mtp_loss_split(self) -> bool:
+        """Returns True if multiple pipeline stages contain loss (L) tokens."""
+        loss_stage_count = sum(
+            1
+            for pp in range(self.pipeline_model_parallel_size)
+            for vpp in range(self.virtual_pipeline_model_parallel_size)
+            if self.layout[pp][vpp].count(LayerType.loss) > 0
+        )
+        return loss_stage_count > 1
+
+    def get_loss_stage_info(self, pp_rank: int, vp_stage: int):
+        """Returns loss-split info for the given (pp_rank, vp_stage).
+
+        Returns:
+            Tuple of (is_nonfinal_loss_stage, n_chunks_to_keep, n_chunks_received):
+            - is_nonfinal_loss_stage: True if this stage has L tokens but is not the final loss stage
+            - n_chunks_to_keep: number of low-indexed hidden-state chunks to forward to next stage
+            - n_chunks_received: total number of hidden-state chunks received at this stage
+            Returns (False, 0, 0) if this stage has no loss tokens.
+        """
+        n_L_here = self.layout[pp_rank][vp_stage].count(LayerType.loss)
+        if n_L_here == 0:
+            return (False, 0, 0)
+
+        # Collect all loss stages in pipeline order (VPP outer, PP inner)
+        loss_stages = []
+        for vpp in range(self.virtual_pipeline_model_parallel_size):
+            for pp in range(self.pipeline_model_parallel_size):
+                n = self.layout[pp][vpp].count(LayerType.loss)
+                if n > 0:
+                    loss_stages.append((pp, vpp, n))
+
+        # Locate this stage in the ordered list
+        this_idx = next(
+            (i for i, (pp, vpp, _) in enumerate(loss_stages) if pp == pp_rank and vpp == vp_stage),
+            None,
+        )
+        if this_idx is None:
+            return (False, 0, 0)
+
+        is_nonfinal = this_idx < len(loss_stages) - 1
+        # Chunks received = sum of L slots from this stage to end
+        n_chunks_received = sum(n for _, _, n in loss_stages[this_idx:])
+        # Chunks to keep = sum of L slots from next stage to end
+        n_chunks_to_keep = sum(n for _, _, n in loss_stages[this_idx + 1:])
+        return (is_nonfinal, n_chunks_to_keep, n_chunks_received)
 
     def get_num_layers_to_build(
         self,
