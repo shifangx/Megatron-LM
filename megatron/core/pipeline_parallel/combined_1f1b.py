@@ -372,9 +372,18 @@ def combined_forward_backward_step(
             )
             from megatron.core.models.gpt.gpt_model import GPTModel
 
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
+            # EP A2A overlap needs a model that emits a schedule plan. GPTModel
+            # implements build_schedule_plan directly; VLM wrappers (e.g.
+            # Step37Model) run their frozen vision tower eagerly and delegate to
+            # an inner GPTModel language model. Accept either — the returned plan
+            # is validated as an AbstractSchedulePlan just below, so this does not
+            # weaken the real invariant. See docs/ep_overlap_vlm_upstream_issue.md.
+            assert isinstance(unwrapped_model, GPTModel) or hasattr(
+                unwrapped_model, "build_schedule_plan"
+            ), (
+                "EP A2A overlapping requires a GPTModel, or a model that exposes "
+                "build_schedule_plan() returning an AbstractSchedulePlan (e.g. a "
+                "VLM wrapper delegating to an inner GPTModel language model)."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
