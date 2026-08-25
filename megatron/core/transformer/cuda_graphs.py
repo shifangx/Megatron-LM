@@ -2344,12 +2344,38 @@ class TECudaGraphHelper:
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
+            elif capture_mode == "runtime" and auto_num_slots < runtime_num_microbatches:
+                # Capture only as many graph slots as the PP/VPP schedule can keep alive at
+                # once, instead of one per microbatch in the global batch.
+                #
+                # This is safe because replay already wraps around a smaller pool: both
+                # MegatronModule._te_cuda_graph_replay and TransformerLayer.backward_dw
+                # select their graph with `microbatch_idx % len(self.cuda_graphs)`, and a
+                # microbatch's forward and backward derive the same index from the same
+                # counter, so they always hit the same slot. auto_num_slots is by
+                # construction the maximum number of microbatches whose forward has run but
+                # whose backward has not (see
+                # _get_required_num_microbatch_slots_from_order), so by the time the modulo
+                # wraps onto a slot again, the microbatch that previously held it has
+                # completed its backward and released the static buffers.
+                #
+                # Example, 1F1B with PP=2 and 4 microbatches on stage 0: the order is
+                # F0 F1 B0 F2 B1 F3 B2 B3 with at most 2 microbatches outstanding, so 2
+                # slots suffice -- F2 reuses slot 0 only after B0, F3 reuses slot 1 only
+                # after B1.
+                #
+                # Guarded on capture_mode == "runtime": under THD varlen packing the real
+                # microbatch count varies between iterations, so capture must keep the
+                # GBS-derived upper bound rather than a count derived from this
+                # iteration's schedule.
+                self.num_microbatches = auto_num_slots
+                capture_mode = "liveness"
+                fallback_reason = None
             else:
                 # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
                 # slot liveness. THD varlen packing can produce different real microbatch
                 # counts across iterations, so capture uses the THD/GBS-derived upper
-                # bound instead of the reduced slot count for safety. Currently TE cuda
-                # graph backend may crash if use the auto_num_slots.
+                # bound instead of the reduced slot count for safety.
                 self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
                 fallback_reason = None
             log_on_each_pipeline_stage(
