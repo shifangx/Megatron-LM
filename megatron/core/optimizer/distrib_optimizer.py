@@ -76,19 +76,25 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 
 logger = getLogger(__name__)
 
-# Debug switch. When the DEBUG_OPT_SKIP_MAIN_GRAD_COPY environment variable is set
-# to a truthy value, copy_group_grads() skips
-# `shard_main_param.grad = shard_model_grad.float()`, i.e. the FP32 main-grad copy
-# inside _copy_model_grads_to_main_grads(). This isolates the cost of that copy
-# (on a bf16 grad buffer it allocates one FP32 tensor per owned param shard every
-# iteration) for memory and timing experiments.
+# Debug switch for the FP32 main-grad copy in _copy_model_grads_to_main_grads().
+# On a bf16 grad buffer `shard_model_grad.float()` allocates one FP32 tensor per
+# owned param shard every iteration; these modes isolate that cost for memory and
+# timing experiments. Set the DEBUG_OPT_MAIN_GRAD_MODE environment variable to:
 #
-# THIS BREAKS TRAINING. With `.grad` left as None the inner optimizer has nothing
-# to step on, so parameters are never updated and the reported grad norm is
-# meaningless. Never set it on a run whose loss curve matters.
-DEBUG_OPT_SKIP_MAIN_GRAD_COPY = os.environ.get(
-    "DEBUG_OPT_SKIP_MAIN_GRAD_COPY", ""
-).strip().lower() in ("1", "true", "yes", "on")
+#   "skip"     do not assign `.grad` at all
+#   "no_cast"  assign the grad slice as-is, without the FP32 cast
+#   unset      normal behaviour, `.grad = shard_model_grad.float()`
+#
+# BOTH MODES BREAK TRAINING, in different ways:
+#   - "skip" leaves `.grad` as None, so the inner optimizer has nothing to step on;
+#     no parameter is updated and the reported grad norm is meaningless.
+#   - "no_cast" only works where the grad buffer already matches the main param
+#     dtype. Elsewhere PyTorch rejects the assignment ("assigned grad has data of a
+#     different type") -- the very constraint the precision-aware optimizer works
+#     around with `.decoupled_grad` further down.
+#
+# Never set either on a run whose loss curve matters.
+DEBUG_OPT_MAIN_GRAD_MODE = os.environ.get("DEBUG_OPT_MAIN_GRAD_MODE", "").strip().lower()
 _debug_opt_warning_emitted = False
 
 
@@ -2811,23 +2817,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        if DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
-                            print(f"debug!!!, shard_main_param.grad={shard_main_param.grad}, shard_model_grad.dtype={shard_model_grad.dtype}")
+                        if DEBUG_OPT_MAIN_GRAD_MODE == "skip":
+                            # Leave `.grad` as None; nothing is allocated.
+                            pass
+                        elif DEBUG_OPT_MAIN_GRAD_MODE == "no_cast":
+                            shard_main_param.grad = shard_model_grad
                         else:
                             shard_main_param.grad = shard_model_grad.float()
 
-        if DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
+        if DEBUG_OPT_MAIN_GRAD_MODE:
             global _debug_opt_warning_emitted
             if not _debug_opt_warning_emitted:
                 _debug_opt_warning_emitted = True
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "DEBUG_OPT_SKIP_MAIN_GRAD_COPY is set: skipping the FP32 main-grad copy "
-                    "in _copy_model_grads_to_main_grads(). Main params keep grad=None, so "
-                    "the optimizer will not update any parameter and the grad norm is "
-                    "meaningless. Use only for memory/timing experiments.",
-                )
+                if DEBUG_OPT_MAIN_GRAD_MODE in ("skip", "no_cast"):
+                    message = (
+                        f"DEBUG_OPT_MAIN_GRAD_MODE={DEBUG_OPT_MAIN_GRAD_MODE}: altering the FP32 "
+                        "main-grad copy in _copy_model_grads_to_main_grads(). Training results "
+                        "are invalid; use only for memory/timing experiments."
+                    )
+                else:
+                    message = (
+                        f"DEBUG_OPT_MAIN_GRAD_MODE={DEBUG_OPT_MAIN_GRAD_MODE!r} is not a known "
+                        "mode ('skip' or 'no_cast'); running with the normal FP32 main-grad copy."
+                    )
+                log_single_rank(logger, logging.WARNING, message)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
