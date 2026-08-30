@@ -2810,8 +2810,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Note that this requires corresponding modifications in the optimizer (Let
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
-                    elif not DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
-                        shard_main_param.grad = shard_model_grad.float()
+                    else:
+                        if DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
+                            print(f"debug!!!, shard_main_param.grad={shard_main_param.grad}, shard_model_grad.dtype={shard_model_grad.dtype}")
+                        else:
+                            shard_main_param.grad = shard_model_grad.float()
+
                     # else: the debug switch is on — leave `.grad` untouched (None
                     # after zero_grad) so the FP32 copy above is never materialized.
                     # See DEBUG_OPT_SKIP_MAIN_GRAD_COPY at the top of this module.
