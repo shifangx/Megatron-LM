@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -74,6 +75,21 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+# Debug switch. When the DEBUG_OPT_SKIP_MAIN_GRAD_COPY environment variable is set
+# to a truthy value, copy_group_grads() skips
+# `shard_main_param.grad = shard_model_grad.float()`, i.e. the FP32 main-grad copy
+# inside _copy_model_grads_to_main_grads(). This isolates the cost of that copy
+# (on a bf16 grad buffer it allocates one FP32 tensor per owned param shard every
+# iteration) for memory and timing experiments.
+#
+# THIS BREAKS TRAINING. With `.grad` left as None the inner optimizer has nothing
+# to step on, so parameters are never updated and the reported grad norm is
+# meaningless. Never set it on a run whose loss curve matters.
+DEBUG_OPT_SKIP_MAIN_GRAD_COPY = os.environ.get(
+    "DEBUG_OPT_SKIP_MAIN_GRAD_COPY", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_debug_opt_warning_emitted = False
 
 
 class Range:
@@ -2794,8 +2810,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Note that this requires corresponding modifications in the optimizer (Let
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
-                    else:
+                    elif not DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
                         shard_main_param.grad = shard_model_grad.float()
+                    # else: the debug switch is on — leave `.grad` untouched (None
+                    # after zero_grad) so the FP32 copy above is never materialized.
+                    # See DEBUG_OPT_SKIP_MAIN_GRAD_COPY at the top of this module.
+
+        if DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
+            global _debug_opt_warning_emitted
+            if not _debug_opt_warning_emitted:
+                _debug_opt_warning_emitted = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "DEBUG_OPT_SKIP_MAIN_GRAD_COPY is set: skipping the FP32 main-grad copy "
+                    "in _copy_model_grads_to_main_grads(). Main params keep grad=None, so "
+                    "the optimizer will not update any parameter and the grad norm is "
+                    "meaningless. Use only for memory/timing experiments.",
+                )
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
