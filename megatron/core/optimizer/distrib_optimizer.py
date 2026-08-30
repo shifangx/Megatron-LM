@@ -2816,10 +2816,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         else:
                             shard_main_param.grad = shard_model_grad.float()
 
-                    # else: the debug switch is on — leave `.grad` untouched (None
-                    # after zero_grad) so the FP32 copy above is never materialized.
-                    # See DEBUG_OPT_SKIP_MAIN_GRAD_COPY at the top of this module.
-
         if DEBUG_OPT_SKIP_MAIN_GRAD_COPY:
             global _debug_opt_warning_emitted
             if not _debug_opt_warning_emitted:
