@@ -122,7 +122,10 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metric_tensor_size,
+    get_moe_metrics_tracker,
+)
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -3530,6 +3533,7 @@ def training_log(
             num_layers=layers,
             num_moe_layers=num_moe_layers,
             moe_layer_freq=args.moe_layer_freq,
+            metric_tensor_size=get_moe_metric_tensor_size(args),
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )

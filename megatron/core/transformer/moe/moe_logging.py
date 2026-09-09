@@ -100,6 +100,26 @@ def get_mtp_metric_slots(config) -> int:
     return len(pattern) if pattern else mtp_num_layers
 
 
+def get_moe_metric_tensor_size(config) -> int:
+    """Size of the per-layer metric tensor for a model, in slots.
+
+    This is the single definition of the tracker's index space: the router
+    indexes with ``layer_number - 1`` over the main decoder's layers followed
+    by the MTP module's (see :func:`get_mtp_metric_slots`). Both the ``record()``
+    path and ``report(force_initialize=True)`` must agree on it, or the
+    ``all_reduce`` in ``_sync_metrics`` sees different shapes on different ranks
+    and hangs. Deriving both from this function is what keeps them in step.
+
+    Args:
+        config: A ``TransformerConfig``, provider, or argparse namespace
+            carrying ``num_layers`` and the MTP fields.
+
+    Returns:
+        Number of slots the metric tensor needs.
+    """
+    return config.num_layers + get_mtp_metric_slots(config)
+
+
 def destroy_moe_metrics_tracker() -> None:
     """Reset the global MoE metrics tracker to ``None``."""
     global _MOE_METRICS_TRACKER
@@ -180,6 +200,7 @@ class MoEMetricsTracker:
         num_moe_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
+        metric_tensor_size: Optional[int] = None,
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
         percentiles: Optional[Dict[str, List[float]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -205,7 +226,13 @@ class MoEMetricsTracker:
             num_moe_layers: Number of MoE aux-loss contributors to average over.
                 When set, this overrides ``moe_layer_freq`` and ``mtp_num_layers``.
             moe_layer_freq: MoE layer frequency or binary pattern list.
-            mtp_num_layers: Extra layers from Multi-Token Prediction.
+            mtp_num_layers: Extra MTP layers counted into *num_moe_layers*.
+            metric_tensor_size: Tensor size to pre-create under
+                *force_initialize*.  Must equal what ``record()`` allocates;
+                pass :func:`get_moe_metric_tensor_size` of the same config.
+                Falls back to ``num_layers + mtp_num_layers`` when omitted,
+                which is only correct when *num_layers* already means the whole
+                index space and MTP contributes one layer per depth.
             total_loss_dict: Megatron training-loop accumulator.  Metrics
                 ending with ``"loss"`` are accumulated here and excluded from
                 the returned console log string.
@@ -218,13 +245,21 @@ class MoEMetricsTracker:
         """
         metric_names = self._resolve_names(track_names)
 
-        # Pre-create entries on PP ranks that lack MoE layers.
-        # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
-        # recorded via record(), otherwise all_reduce across PP will hang.
+        # Pre-create entries on PP ranks that lack MoE layers. The size must be
+        # what record() allocated on the ranks that do have them, otherwise the
+        # all_reduce in _sync_metrics hangs on mismatched shapes. Callers should
+        # pass metric_tensor_size (= get_moe_metric_tensor_size(config)), which
+        # is the same expression record()'s callers use; the fallback keeps
+        # older callers working but cannot see how they mean `num_layers`.
         if force_initialize:
-            if num_layers is None:
-                raise ValueError("num_layers must be provided when force_initialize=True.")
-            init_size = num_layers + (mtp_num_layers or 0)
+            init_size = metric_tensor_size
+            if init_size is None:
+                if num_layers is None:
+                    raise ValueError(
+                        "num_layers or metric_tensor_size must be provided when "
+                        "force_initialize=True."
+                    )
+                init_size = num_layers + (mtp_num_layers or 0)
             for name in metric_names:
                 self.ensure_initialized(name, init_size)
 

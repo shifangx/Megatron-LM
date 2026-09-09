@@ -1173,6 +1173,7 @@ def track_moe_metrics(
     num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
+    metric_tensor_size: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> str:
     """Track the MoE metrics for logging.
@@ -1191,6 +1192,7 @@ def track_moe_metrics(
         num_moe_layers=num_moe_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
+        metric_tensor_size=metric_tensor_size,
         pg_collection=pg_collection,
         total_loss_dict=total_loss_dict,
     )

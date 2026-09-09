@@ -12,8 +12,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metric_tensor_size,
     get_moe_metrics_tracker,
-    get_mtp_metric_slots,
 )
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -594,7 +594,7 @@ class TopKRouter(Router):
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
         # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers + get_mtp_metric_slots(self.config)
+        num_layers = get_moe_metric_tensor_size(self.config)
 
         if self.is_mtp_layer:
             layer_number = self.layer_number + self.config.num_layers
@@ -695,7 +695,7 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers + get_mtp_metric_slots(self.config)
+            num_layers = get_moe_metric_tensor_size(self.config)
 
             if self.is_mtp_layer:
                 layer_number = self.layer_number + self.config.num_layers
