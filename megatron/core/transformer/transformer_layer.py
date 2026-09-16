@@ -281,6 +281,7 @@ class TransformerLayerSubmodules:
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
@@ -291,6 +292,7 @@ class TransformerLayerSubmodules:
     mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -407,6 +409,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
+        self.post_self_attn_layernorm = build_module(
+            submodules.post_self_attn_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
@@ -473,6 +482,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        self.post_mlp_layernorm = build_module(
+            submodules.post_mlp_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon
+        )
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -765,6 +781,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
+
+        attention_output, attention_output_bias = attention_output_with_bias
+        attention_output = self.post_self_attn_layernorm(attention_output)
+        attention_output_with_bias = (attention_output, attention_output_bias)
 
         hidden_states = self._apply_self_attn_bda_step(
             attention_output_with_bias, residual, attn_state
@@ -1197,6 +1217,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
+
+        mlp_output, mlp_output_bias = mlp_output_with_bias
+        mlp_output = self.post_mlp_layernorm(mlp_output)
+        mlp_output_with_bias = (mlp_output, mlp_output_bias)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

@@ -1488,14 +1488,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
             input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
             mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=False,
-        )
+        # RL trainers (slime) call the model with position_ids=None and let the
+        # embedding derive them, so there is nothing to roll here.
+        if position_ids is not None:
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+                return_sum=False,
+            )
         if padding_mask is not None:
             padding_mask, _ = roll_tensor(
                 padding_mask,

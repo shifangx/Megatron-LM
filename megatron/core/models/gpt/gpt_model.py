@@ -442,6 +442,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
@@ -582,6 +584,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        mtp_kwargs: Optional[dict] = None,
     ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -671,6 +674,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            mtp_kwargs=mtp_kwargs,
         )
 
     def _postprocess(
@@ -696,12 +700,26 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        mtp_kwargs=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
+
+        ``mtp_kwargs`` carries the MTP-only inputs used by RL trainers (slime), which
+        call this model with ``labels=None`` because the policy loss is computed
+        outside the model. ``mtp_kwargs['mtp_labels']`` holds the unshifted token ids
+        MTP should predict from; it is routed to ``process_mtp_loss`` as ``input_ids``
+        so the shift-by-one and the matching ``loss_mask`` roll happen there. When
+        neither ``labels`` nor ``mtp_labels`` is supplied there is nothing for MTP to
+        score, so the MTP layers and their loss are skipped entirely.
         """
+        mtp_kwargs = mtp_kwargs or {}
+        mtp_labels = mtp_kwargs.get('mtp_labels')
+        # Something to predict: explicit MTP labels, or the ordinary LM labels.
+        has_mtp_labels = mtp_labels is not None or labels is not None
+
         in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -720,7 +738,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if mtp_in_postprocess and has_mtp_labels and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -754,14 +772,23 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     )
                 else:
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and has_mtp_labels:
+                # RL trainers hand MTP its own labels and expect the heads to be
+                # detached, so the MTP loss never feeds gradients back into the
+                # shared output weight.
+                mtp_output_weight = output_weight
+                if mtp_labels is not None:
+                    if mtp_output_weight is None:
+                        mtp_output_weight = self.output_layer.weight
+                    if mtp_output_weight is not None:
+                        mtp_output_weight = mtp_output_weight.detach()
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
-                    labels=labels,
+                    labels=None if mtp_labels is not None else labels,
                     loss_mask=loss_mask,
                     output_layer=self.output_layer,
-                    output_weight=output_weight,
+                    output_weight=mtp_output_weight,
                     runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
@@ -770,7 +797,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=input_ids,
+                    input_ids=mtp_labels if mtp_labels is not None else input_ids,
                     mtp_input_mask=mtp_input_mask,
                     metric_avg_group=(
                         getattr(self.pg_collection, 'dp_cp_gtp_remat', None)

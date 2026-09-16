@@ -73,6 +73,12 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             use_gigatoken: whether to use GigaToken implementation
         """
 
+        # slime trains against HF repos whose architecture ships its own tokenizer
+        # code (Qwen3.5-VL), and Megatron's --trust-remote-code defaults to False,
+        # so AutoTokenizer would refuse to load them. Force it on here, matching
+        # slime's own tokenizer loading.
+        trust_remote_code = True
+
         try:
             # this logic deals with different huggingface tokenizers having different args
             if vocab_file is None:
