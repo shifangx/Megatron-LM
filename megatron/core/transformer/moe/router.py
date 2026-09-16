@@ -309,6 +309,24 @@ class TopKRouter(Router):
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
+        # slime's own routing replay, carried over from
+        # slime/docker/patch/latest/megatron.patch. It is separate from the
+        # upstream mechanism above: register_routing_replay() is a no-op unless
+        # ENABLE_ROUTING_REPLAY=1 is in the environment, and when it is set it
+        # installs a forward pre-hook so the training pass can reuse the expert
+        # routing the rollout produced.
+        #
+        # The image's patch imports slime unconditionally, which is safe inside
+        # the slime container and only there. The guard keeps this checkout
+        # usable as a plain Megatron-LM; when slime is importable the behaviour
+        # is identical to the image's.
+        try:
+            from slime.utils.routing_replay import register_routing_replay
+        except ImportError:
+            pass
+        else:
+            register_routing_replay(self)
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.

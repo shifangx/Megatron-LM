@@ -3012,6 +3012,11 @@ def _add_network_size_args(parser):
         'This is added for computational efficieny reasons.',
     )
     group.add_argument(
+        '--use-gated-attention',
+        action='store_true',
+        help='If set, use gated attention as in Qwen3Next',
+    )
+    group.add_argument(
         '--openai-gelu',
         action='store_true',
         help='Use OpenAIs GeLU implementation. This option'
