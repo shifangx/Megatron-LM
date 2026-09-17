@@ -182,6 +182,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     fallback_to_eager_attn: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -263,9 +265,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             ),
         )
     else:
@@ -289,9 +293,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -537,6 +543,8 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            post_self_attn_layernorm=config.post_self_attn_layernorm,
+            post_mlp_layernorm=config.post_mlp_layernorm,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -547,6 +555,8 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            post_self_attn_layernorm=config.post_self_attn_layernorm,
+            post_mlp_layernorm=config.post_mlp_layernorm,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(

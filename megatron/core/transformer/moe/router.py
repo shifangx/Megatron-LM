@@ -207,6 +207,9 @@ class TopKRouter(Router):
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
+        from slime.utils.routing_replay import register_routing_replay
+        register_routing_replay(self)
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.

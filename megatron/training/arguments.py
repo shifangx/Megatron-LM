@@ -1388,6 +1388,9 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['inference_sampling_seed'] = args.seed
 
+    kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
+    kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
+
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
     # Kitchen library is available.
@@ -1701,6 +1704,8 @@ def _add_network_size_args(parser):
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
+    group.add_argument('--use-gated-attention', action='store_true',
+                       help='If set, use gated attention as in Qwen3Next')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'

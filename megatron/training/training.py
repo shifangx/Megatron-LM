@@ -1327,6 +1327,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Wait for the default stream to complete before starting ddp_stream
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
+        dp_extra_kwargs = {}
+        if DP is DDP:
+            dp_extra_kwargs['disable_grad_buffers_cpu_backup'] = getattr(
+                args, 'disable_grad_buffers_cpu_backup', False
+            )
+            dp_extra_kwargs['disable_param_buffers_cpu_backup'] = getattr(
+                args, 'disable_param_buffers_cpu_backup', False
+            )
         with torch.cuda.stream(ddp_stream):
             model = [
                 DP(
@@ -1337,6 +1345,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0)
                     or args.overlap_param_gather_with_optimizer_step,
+                    **dp_extra_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]

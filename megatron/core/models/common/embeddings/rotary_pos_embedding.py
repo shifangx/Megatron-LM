@@ -308,6 +308,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         self,
         position_ids: torch.Tensor,
         mrope_section: List[int],
+        packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
@@ -352,7 +353,9 @@ class MultimodalRotaryEmbedding(nn.Module):
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         if cp_group is None:
             cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1:
+        # For THD (packed sequence) format, skip CP slicing here — it is handled
+        # per-sequence inside _apply_rotary_pos_emb_thd instead (same as RotaryEmbedding).
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)

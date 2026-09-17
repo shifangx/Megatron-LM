@@ -711,6 +711,9 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
+    from slime.utils.routing_replay import get_routing_replay_compute_topk
+    compute_topk = get_routing_replay_compute_topk(compute_topk)
+
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)

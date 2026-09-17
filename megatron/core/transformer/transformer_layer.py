@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -34,6 +35,22 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _use_sglang_fused_residual_rmsnorm() -> bool:
+    """Whether to match SGLang's FP32 residual-add/RMSNorm boundary."""
+
+    return os.environ.get("MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS", "0") == "1"
+
+
+def _sglang_native_rmsnorm_from_fp32_sum(
+    value_fp32: Tensor, weight: Tensor, eps: float, output_dtype: torch.dtype
+) -> Tensor:
+    """Normalize an unrounded FP32 residual sum like SGLang RMSNorm."""
+
+    variance = value_fp32.pow(2).mean(dim=-1, keepdim=True)
+    normalized = value_fp32 * torch.rsqrt(variance + eps)
+    return (normalized * weight).to(output_dtype)
 
 
 def get_transformer_layer_offset(
@@ -224,6 +241,7 @@ class TransformerLayerSubmodules:
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
@@ -232,6 +250,7 @@ class TransformerLayerSubmodules:
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -311,6 +330,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
+        self.post_self_attn_layernorm = build_module(
+            submodules.post_self_attn_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = build_module(
             submodules.pre_cross_attn_layernorm,
@@ -375,6 +401,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        self.post_mlp_layernorm = build_module(
+            submodules.post_mlp_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon
+        )
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -581,7 +614,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
+                exact_residual_sum = getattr(hidden_states, "_sglang_residual_sum_fp32", None)
+                if _use_sglang_fused_residual_rmsnorm() and exact_residual_sum is not None:
+                    input_layernorm_output = _sglang_native_rmsnorm_from_fp32_sum(
+                        exact_residual_sum,
+                        self.input_layernorm.weight,
+                        float(self.config.layernorm_epsilon),
+                        hidden_states.dtype,
+                    )
+                else:
+                    input_layernorm_output = self.input_layernorm(hidden_states)
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -615,6 +657,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
+        attention_output, attention_output_bias = attention_output_with_bias
+        attention_output = self.post_self_attn_layernorm(attention_output)
+        attention_output_with_bias = (attention_output, attention_output_bias)
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -623,6 +669,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif _use_sglang_fused_residual_rmsnorm():
+            attention_delta, attention_bias = attention_output_with_bias
+            if self.hidden_dropout != 0 or attention_bias is not None:
+                raise RuntimeError(
+                    "MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS requires dropout=0 " "and bias-free attention"
+                )
+            exact_pre_mlp_sum = attention_delta.float() + residual.float()
+            hidden_states = exact_pre_mlp_sum.to(attention_delta.dtype)
+            self._sglang_pre_mlp_sum_fp32 = exact_pre_mlp_sum
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -668,7 +723,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        if self.recompute_pre_mlp_layernorm:
+        exact_pre_mlp_sum = getattr(self, "_sglang_pre_mlp_sum_fp32", None)
+        if _use_sglang_fused_residual_rmsnorm() and exact_pre_mlp_sum is not None:
+            if hasattr(self.mlp, "linear_fc1") and hasattr(self.mlp.linear_fc1, "layer_norm_weight"):
+                norm_weight = self.mlp.linear_fc1.layer_norm_weight
+                self.mlp.linear_fc1._deepgemm_input_already_normalized = True
+            else:
+                norm_weight = self.pre_mlp_layernorm.weight
+            pre_mlp_layernorm_output = _sglang_native_rmsnorm_from_fp32_sum(
+                exact_pre_mlp_sum,
+                norm_weight,
+                float(self.config.layernorm_epsilon),
+                hidden_states.dtype,
+            )
+            self._sglang_pre_mlp_sum_fp32 = None
+        elif self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -794,6 +863,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.inference_fuse_tp_communication
         )
 
+        mlp_output, mlp_output_bias = mlp_output_with_bias
+        mlp_output = self.post_mlp_layernorm(mlp_output)
+        mlp_output_with_bias = (mlp_output, mlp_output_bias)
+
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -809,6 +882,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif _use_sglang_fused_residual_rmsnorm():
+            mlp_delta, mlp_bias = mlp_output_with_bias
+            if self.hidden_dropout != 0 or mlp_bias is not None:
+                raise RuntimeError(
+                    "MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS requires dropout=0 " "and bias-free MLPs"
+                )
+            exact_layer_sum = mlp_delta.float() + residual.float()
+            hidden_states = exact_layer_sum.to(mlp_delta.dtype)
+            self._sglang_residual_sum_fp32 = exact_layer_sum
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -831,6 +913,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        exact_layer_sum = getattr(self, "_sglang_residual_sum_fp32", None)
+        if _use_sglang_fused_residual_rmsnorm() and exact_layer_sum is not None:
+            output._sglang_residual_sum_fp32 = exact_layer_sum
 
         return output
 

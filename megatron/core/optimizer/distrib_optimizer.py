@@ -686,6 +686,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
                 # align the step across param groups.
                 param_group["step"] = int(step)
+            if "step" in param_group and param_group["step"] is None:
+                del param_group["step"]
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -968,6 +970,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_state = []
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
                         tensors = self._get_main_param_and_optimizer_states(model_param)
+                        if "step" in tensors:
+                            # Step is restored from optimizer param_groups. Keeping it in
+                            # bucket state makes it common checkpoint state whose list
+                            # skeleton depends on save-time optimizer placement.
+                            del tensors["step"]
                         tensors.update(
                             {
                                 "gbuf_local_start": param_range_map["gbuf_local"].start,
@@ -1667,6 +1674,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if key == 'padding':
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
                                 continue
+                            if key == 'step':
+                                # The optimizer state of STEP is a 0-dim tensor and is handled
+                                # separately via param_groups, not as part of the gradient buffer.
+                                tensors[key] = LocalNonpersistentObject(tensors[key])
+                                continue
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                 tensors[key].shape,
                                 gbuf_local_start,
@@ -1801,6 +1813,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
+                        # Local metadata used for checkpoint merging/filtering, not optimizer state.
+                        src_tensors.pop('padding', None)
+                        # Step is restored from optimizer param_groups.
+                        src_tensors.pop('step', None)
+
                         # Main param & optimizer states.
                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
 
