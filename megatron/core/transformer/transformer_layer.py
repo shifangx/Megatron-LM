@@ -782,9 +782,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        attention_output, attention_output_bias = attention_output_with_bias
-        attention_output = self.post_self_attn_layernorm(attention_output)
-        attention_output_with_bias = (attention_output, attention_output_bias)
+        # slime patch: GLM-4's post-attention layernorm, and *only* when a spec
+        # actually asked for one.
+        #
+        # The guard is not defensive tidiness. In a hybrid stack the MLP and MoE
+        # layers are TransformerLayers too (megatron/core/ssm/mlp_layer.py:
+        # `class MLPLayer(TransformerLayer)`, no forward of its own) whose
+        # submodules never set self_attention, so it defaults to IdentityOp and
+        # this "attention output with bias" is a bare [s, b, h] tensor. Unpacking
+        # a tensor into two names iterates its first dimension, so the line below
+        # used to raise `ValueError: too many values to unpack (expected 2)` --
+        # sequence length values, expected 2 -- on the first MoE layer of
+        # Nemotron-3's 88-layer pattern. Job 18809189 died there, 23.8 s into its
+        # first forward, after everything else in the stack had worked.
+        #
+        # Upstream never unpacks here: it hands the value straight to
+        # _apply_self_attn_bda_step, and on those layers self_attn_bda is
+        # IdentityFuncOp, which passes a tensor through untouched.
+        if not isinstance(self.post_self_attn_layernorm, IdentityOp):
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
 
         hidden_states = self._apply_self_attn_bda_step(
             attention_output_with_bias, residual, attn_state
@@ -1218,9 +1236,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        mlp_output, mlp_output_bias = mlp_output_with_bias
-        mlp_output = self.post_mlp_layernorm(mlp_output)
-        mlp_output_with_bias = (mlp_output, mlp_output_bias)
+        # slime patch: the mirror of the post_self_attn_layernorm guard above,
+        # and it fails the same way for the opposite reason. A hybrid stack's
+        # *attention* layer spec carries no mlp (hybrid_layer_specs.py), so its
+        # mlp is IdentityOp and mlp_output_with_bias is a bare tensor. Fixing
+        # only the attention side would have moved job 18809189's crash from the
+        # first MoE layer to the first attention layer.
+        if not isinstance(self.post_mlp_layernorm, IdentityOp):
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            mlp_output = self.post_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, mlp_output_bias)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
