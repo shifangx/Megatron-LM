@@ -227,8 +227,32 @@ except ImportError:
 try:
     from torch_memory_saver import torch_memory_saver
 
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
+    # slime patch: do not set the hook mode here.
+    #
+    # torch_memory_saver.hook_mode is process-global and is consumed the first
+    # time TMS initializes, so an import side effect decides it for the whole
+    # process. slime imports this module in every training actor
+    # (slime/backends/megatron_utils/model.py: from megatron.training.training
+    # import get_model) after having set that process up for *preload* mode:
+    # with --offload-train it puts torch_memory_saver_hook_mode_preload_*.so on
+    # LD_PRELOAD and sets TMS_INIT_ENABLE=1 (slime/ray/actor_group.py).
+    #
+    # Switching to "torch" here leaves two TMS backends in one process: the
+    # preloaded library actually interposing cudaMalloc, and a torch-mode
+    # library that the Python object holds. torch_memory_saver.disable() then
+    # clears tms_set_interesting_region on the torch-mode .so while the
+    # preloaded interposer keeps allocating VMM memory, so tensors created in
+    # that window cannot be exported as CUDA IPC handles -- the colocated
+    # weight sync dies in storage._share_cuda_() with cudaErrorInvalidValue
+    # (jobs 18797342, 18797223). The same flag, set from
+    # inference/contexts/dynamic_context.py, previously killed job 18743074 at
+    # SGLang CUDA-graph capture; that copy is disabled by this patch too.
+    #
+    # HAVE_TORCH_MEMORY_SAVER gates only Megatron's own RL-inference weight
+    # offload below (--rl-offload-inference-model-weights-when-idle), which
+    # slime never uses: its rollout engine is SGLang.
+    # torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = False
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
