@@ -296,6 +296,7 @@ class TransformerLayerSubmodules:
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_self_attn_layernorm: LayerNormBuilder = IdentityOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
@@ -306,6 +307,7 @@ class TransformerLayerSubmodules:
     mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: LayerNormBuilder = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -440,6 +442,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
+        # Optional layernorm on the attention output, before the residual add.
+        self.post_self_attn_layernorm = submodules.post_self_attn_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
@@ -507,6 +516,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Optional layernorm on the MLP output, before the residual add.
+        self.post_mlp_layernorm = submodules.post_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
 
         # Cache whether these optional layernorms are materialized. The split hybrid mHC
         # recompute and fine-grained activation-offloading paths share these predicates.
@@ -587,7 +603,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
                             set_save_original_input(self.mlp.linear_fc1)
             if "mlp" in self.config.recompute_modules:
-                if not self.is_moe_layer:
+                if not self.is_moe_layer and not isinstance(self.mlp, IdentityOp):
                     self.recompute_mlp = True
 
         self._set_offload_modules()
@@ -1044,6 +1060,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
+        # A layer whose spec omits `self_attention` got an IdentityOp from build_module, which
+        # returns the hidden states rather than an (output, bias) pair, so there is neither an
+        # attention output to normalize nor an attention residual to add. The hybrid stack's
+        # mlp_layer and moe_layer are built this way.
+        skip_bda = isinstance(self.self_attention, IdentityOp)
+        if not skip_bda:
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
         residual_connection = self._get_self_attention_residual_connection()
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
@@ -1051,7 +1076,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
+        if skip_bda:
+            hidden_states = attention_output_with_bias
+        elif using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # self attention module.
@@ -1629,11 +1656,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
+        # A layer whose spec omits `mlp` got an IdentityOp from build_module, which returns the
+        # hidden states rather than an (output, bias) pair, so there is neither an MLP output to
+        # normalize nor an MLP residual to add. The hybrid stack's attention layers are built this
+        # way; this is the MLP-side twin of the no-attention case in _apply_self_attn_bda_step.
+        skip_bda = isinstance(self.mlp, IdentityOp)
+        if not skip_bda:
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            mlp_output = self.post_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, mlp_output_bias)
         residual_connection = self._get_mlp_residual_connection()
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
-        if self.recompute_pre_mlp_layernorm:
+        if self.recompute_pre_mlp_layernorm and not skip_bda:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
@@ -1643,7 +1679,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
+        if skip_bda:
+            hidden_states = mlp_output_with_bias
+        elif using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # MLP module.

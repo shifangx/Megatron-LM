@@ -650,6 +650,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        mtp_kwargs: Optional[dict] = None,
     ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -757,6 +758,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             mhc_multistream=mhc_multistream,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            mtp_kwargs=mtp_kwargs,
         )
 
     def _postprocess(
@@ -783,6 +785,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         mhc_multistream=None,
         output_processor=None,
         output_processor_context=None,
+        mtp_kwargs=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -848,12 +851,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     mtp_input_mask=mtp_input_mask if mtp_in_postprocess else None,
                 )
 
+        # RL-style callers run several label-free forward passes over the same batch
+        # (reference / old-actor log probs). MTP is only meaningful when labels are
+        # available, so it is opt-in per forward: either `labels`, or `mtp_labels`
+        # passed through `mtp_kwargs`.
+        mtp_kwargs = mtp_kwargs or {}
+        mtp_labels = mtp_kwargs.get('mtp_labels')
+        run_mtp = labels is not None or mtp_labels is not None
+
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if mtp_in_postprocess and run_mtp and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -876,7 +887,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers:
+        if self.config.mtp_num_layers and run_mtp:
             assert self.config.mtp_num_layers > 0
             if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
@@ -906,7 +917,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=input_ids,
+                    input_ids=mtp_labels if mtp_labels is not None else input_ids,
                     mtp_input_mask=mtp_input_mask,
                     metric_avg_group=(
                         getattr(self.pg_collection, 'dp_cp_gtp_remat', None)

@@ -10,6 +10,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 

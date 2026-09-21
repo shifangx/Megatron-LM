@@ -352,6 +352,14 @@ class TransformerConfig(ModelParallelConfig):
     num_query_groups >= tp, and under fp8/fp4 a per-partition
     linear_qkv_out_dim aligned to 16/32."""
 
+    post_self_attn_layernorm: bool = False
+    """Whether to apply a layernorm to the self-attention output before the residual add
+    (GLM-style sandwich norm)."""
+
+    post_mlp_layernorm: bool = False
+    """Whether to apply a layernorm to the MLP output before the residual add
+    (GLM-style sandwich norm)."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 

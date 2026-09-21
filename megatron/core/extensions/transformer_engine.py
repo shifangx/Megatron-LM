@@ -1458,6 +1458,9 @@ class TELinear(te.pytorch.Linear):
                 **extra_kwargs,
             )
 
+        for param in self.parameters():
+            setattr(param, "parallel_mode", parallel_mode)
+
         if is_expert:
             _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
         else:

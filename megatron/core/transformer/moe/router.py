@@ -348,6 +348,8 @@ class TopKRouter(Router):
 
         if layer_number is not None:
             self.set_layer_number(layer_number)
+        from slime.utils.routing_replay import register_routing_replay
+        register_routing_replay(self)
 
     def set_layer_number(self, layer_number: int):
         """Set the layer number and initialize hash routing for eligible layers."""
