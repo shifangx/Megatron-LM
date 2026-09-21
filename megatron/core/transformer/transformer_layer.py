@@ -837,9 +837,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        attention_output, attention_output_bias = attention_output_with_bias
-        attention_output = self.post_self_attn_layernorm(attention_output)
-        attention_output_with_bias = (attention_output, attention_output_bias)
+        # Hybrid MLP/MoE layers use IdentityOp attention, which returns a bare tensor.
+        if not isinstance(self.post_self_attn_layernorm, IdentityOp):
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -1219,9 +1221,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        mlp_output, mlp_output_bias = mlp_output_with_bias
-        mlp_output = self.post_mlp_layernorm(mlp_output)
-        mlp_output_with_bias = (mlp_output, mlp_output_bias)
+        # Hybrid attention-only layers likewise return a bare tensor from their MLP.
+        if not isinstance(self.post_mlp_layernorm, IdentityOp):
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            mlp_output = self.post_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, mlp_output_bias)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
