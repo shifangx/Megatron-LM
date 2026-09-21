@@ -281,6 +281,7 @@ class TransformerLayerSubmodules:
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_self_attn_layernorm: LayerNormBuilder = IdentityOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
@@ -291,6 +292,7 @@ class TransformerLayerSubmodules:
     mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: LayerNormBuilder = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -407,6 +409,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
+        # Optional layernorm on the self-attention output, before the residual add.
+        self.post_self_attn_layernorm = submodules.post_self_attn_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
@@ -473,6 +482,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Optional layernorm on the MLP output, before the residual add.
+        self.post_mlp_layernorm = submodules.post_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -542,7 +558,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
                             set_save_original_input(self.mlp.linear_fc1)
             if "mlp" in self.config.recompute_modules:
-                if not self.is_moe_layer:
+                # An IdentityOp mlp has nothing to recompute; wrapping it in a
+                # checkpoint would only add an autograd node and an RNG-state
+                # copy per attention layer of a hybrid stack.
+                if not self.is_moe_layer and not isinstance(self.mlp, IdentityOp):
                     self.recompute_mlp = True
 
         self._set_offload_modules()
@@ -820,20 +839,45 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
-            hidden_states = attention_output_with_bias[0]
+
+        if isinstance(self.self_attention, IdentityOp):
+            # This layer has no attention. Its spec omits `self_attention`, so
+            # build_module gave it an IdentityOp, which returned the hidden
+            # states unchanged rather than an (output, bias) pair -- unpacking
+            # that below would split a [seq, batch, hidden] tensor along the
+            # sequence dimension and raise "too many values to unpack
+            # (expected 2)". The hybrid stack's mlp_layer and moe_layer are
+            # built exactly this way (models/hybrid/hybrid_layer_specs.py), so
+            # every MoE layer of a Mamba/MoE/attention model reaches here.
+            #
+            # _run_cross_attention tolerates the same situation for
+            # cross_attention because its bda is an IdentityFuncOp that never
+            # looks inside the value. This path cannot do that: it has to
+            # unpack in order to apply post_self_attn_layernorm to the output
+            # half. So skip the step instead -- there is no attention output to
+            # normalize and no attention residual to add, which is what the
+            # identity self_attn_bda these specs also inherit would have
+            # amounted to anyway.
+            hidden_states = attention_output_with_bias
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
-        nvtx_range_pop(suffix="self_attn_bda")
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            nvtx_range_push(suffix="self_attn_bda")
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # self attention module.
+                hidden_states = attention_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
+            nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
@@ -1198,27 +1242,50 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        if self.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of mlp_output_with_bias[0]
-            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                mlp_output_with_bias[0]
-            )
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # MLP module.
-            hidden_states = mlp_output_with_bias[0]
+        if isinstance(self.mlp, IdentityOp):
+            # This layer has no MLP. Its spec omits `mlp`, so build_module gave
+            # it an IdentityOp, which returned the hidden states unchanged
+            # rather than an (output, bias) pair -- unpacking that below would
+            # split a [seq, batch, hidden] tensor along the sequence dimension
+            # and raise "too many values to unpack (expected 2)". The hybrid
+            # stack's attention_layer, gdn_layer, dsa_layer and mla_layer are
+            # built exactly this way (models/hybrid/hybrid_layer_specs.py), so
+            # every attention layer of a Mamba/MoE/attention model reaches here.
+            #
+            # This is the MLP-side twin of the no-attention case in
+            # _apply_self_attn_bda_step. The identity mlp_bda these specs also
+            # inherit is an IdentityFuncOp that would hand `mlp_output_with_bias`
+            # straight back; what cannot survive is the unpack, which exists only
+            # to apply post_mlp_layernorm to the output half. There is no MLP
+            # output to normalize and no MLP residual to add, so skip the step
+            # and pass the hidden states through.
+            hidden_states = mlp_output_with_bias
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            mlp_output = self.post_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, mlp_output_bias)
+
+            if self.recompute_pre_mlp_layernorm:
+                # discard the output of the pre-mlp layernorm and register the recompute
+                # as a gradient hook of mlp_output_with_bias[0]
+                self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                    mlp_output_with_bias[0]
                 )
-        nvtx_range_pop(suffix="mlp_bda")
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            nvtx_range_push(suffix="mlp_bda")
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # MLP module.
+                hidden_states = mlp_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                        mlp_output_with_bias, residual, self.hidden_dropout
+                    )
+            nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.mlp_norm_manager is not None:

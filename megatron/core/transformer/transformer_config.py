@@ -298,6 +298,14 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    post_self_attn_layernorm: bool = False
+    """Whether to apply a layernorm to the self-attention output before the residual add
+    (GLM-style sandwich norm)."""
+
+    post_mlp_layernorm: bool = False
+    """Whether to apply a layernorm to the MLP output before the residual add
+    (GLM-style sandwich norm)."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 

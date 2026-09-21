@@ -893,6 +893,9 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
+    from slime.utils.routing_replay import get_routing_replay_compute_topk
+    compute_topk = get_routing_replay_compute_topk(compute_topk)
+
     # Precision notes:
     # - Logits are converted to fp32 for score functions.
     # - All the intermediate calculations are in fp32.

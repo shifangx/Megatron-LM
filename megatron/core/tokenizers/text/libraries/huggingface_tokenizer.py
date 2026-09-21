@@ -73,6 +73,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             use_gigatoken: whether to use GigaToken implementation
         """
 
+        # Models whose tokenizer implementation is not in `transformers` yet (GLM,
+        # Nemotron-H, some Qwen VL variants) need remote code regardless of what the
+        # caller asked for.
+        trust_remote_code = True
+
         try:
             # this logic deals with different huggingface tokenizers having different args
             if vocab_file is None:
