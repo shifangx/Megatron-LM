@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
@@ -76,6 +77,22 @@ def _get_offloading_interface():
     )
 
     return FineGrainedActivationOffloadingInterface
+
+
+def _use_sglang_fused_residual_rmsnorm() -> bool:
+    """Whether to match SGLang's FP32 residual-add/RMSNorm boundary."""
+
+    return os.environ.get("MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS", "0") == "1"
+
+
+def _sglang_native_rmsnorm_from_fp32_sum(
+    value_fp32: Tensor, weight: Tensor, eps: float, output_dtype: torch.dtype
+) -> Tensor:
+    """Normalize an unrounded FP32 residual sum like SGLang RMSNorm."""
+
+    variance = value_fp32.pow(2).mean(dim=-1, keepdim=True)
+    normalized = value_fp32 * torch.rsqrt(variance + eps)
+    return (normalized * weight).to(output_dtype)
 
 
 def get_transformer_layer_offset(
@@ -1021,7 +1038,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
         else:
             with self.attn_norm_manager as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+                exact_residual_sum = getattr(hidden_states, "_sglang_residual_sum_fp32", None)
+                if _use_sglang_fused_residual_rmsnorm() and exact_residual_sum is not None:
+                    input_layernorm_output = _sglang_native_rmsnorm_from_fp32_sum(
+                        exact_residual_sum,
+                        self.input_layernorm.weight,
+                        float(self.config.layernorm_epsilon),
+                        hidden_states.dtype,
+                    )
+                    if self._input_layernorm_returns_residual:
+                        input_layernorm_output = (input_layernorm_output, hidden_states)
+                else:
+                    input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
         if recompute_context is not None and self.config.fine_grained_activation_offloading:
             output = (
@@ -1109,6 +1137,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
                     )
+        elif _use_sglang_fused_residual_rmsnorm():
+            attention_delta, attention_bias = attention_output_with_bias
+            if self.hidden_dropout != 0 or attention_bias is not None:
+                raise RuntimeError(
+                    "MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS requires dropout=0 "
+                    "and bias-free attention"
+                )
+            exact_pre_mlp_sum = attention_delta.float() + residual.float()
+            hidden_states = exact_pre_mlp_sum.to(attention_delta.dtype)
+            self._sglang_pre_mlp_sum_fp32 = exact_pre_mlp_sum
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1212,7 +1250,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             or replay_pre_mlp_layernorm
             or (mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm)
         )
-        if checkpoint_pre_mlp_layernorm:
+        exact_pre_mlp_sum = getattr(self, "_sglang_pre_mlp_sum_fp32", None)
+        if _use_sglang_fused_residual_rmsnorm() and exact_pre_mlp_sum is not None:
+            if hasattr(self.mlp, "linear_fc1") and hasattr(self.mlp.linear_fc1, "layer_norm_weight"):
+                norm_weight = self.mlp.linear_fc1.layer_norm_weight
+                self.mlp.linear_fc1._deepgemm_input_already_normalized = True
+            else:
+                norm_weight = self.pre_mlp_layernorm.weight
+            pre_mlp_layernorm_output = _sglang_native_rmsnorm_from_fp32_sum(
+                exact_pre_mlp_sum,
+                norm_weight,
+                float(self.config.layernorm_epsilon),
+                hidden_states.dtype,
+            )
+            if self._pre_mlp_layernorm_returns_residual:
+                pre_mlp_layernorm_output = (pre_mlp_layernorm_output, hidden_states)
+            self._sglang_pre_mlp_sum_fp32 = None
+        elif checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=(
                     residual_stream_recompute_context.manager
@@ -1707,6 +1761,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
                     )
+        elif _use_sglang_fused_residual_rmsnorm():
+            mlp_delta, mlp_bias = mlp_output_with_bias
+            if self.hidden_dropout != 0 or mlp_bias is not None:
+                raise RuntimeError(
+                    "MEGATRON_USE_SGLANG_FUSED_RESIDUAL_RMS requires dropout=0 "
+                    "and bias-free MLPs"
+                )
+            exact_layer_sum = mlp_delta.float() + residual.float()
+            hidden_states = exact_layer_sum.to(mlp_delta.dtype)
+            self._sglang_residual_sum_fp32 = exact_layer_sum
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1731,6 +1795,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        exact_layer_sum = getattr(self, "_sglang_residual_sum_fp32", None)
+        if _use_sglang_fused_residual_rmsnorm() and exact_layer_sum is not None:
+            output._sglang_residual_sum_fp32 = exact_layer_sum
 
         return output
 
